@@ -107,16 +107,9 @@ class LoadingScreen(QWidget):
         
         layout.addWidget(self.logo_container, alignment=Qt.AlignCenter)
         
-        # Title
-        title_label = QLabel("Anilag")
-        title_label.setFont(QFont("Arial", 24, QFont.Bold))
-        title_label.setStyleSheet("color: #2E7D32;")
-        title_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(title_label)
-        
         # Tagline
         tagline_label = QLabel("Rice Weevil Detection System")
-        tagline_label.setFont(QFont("Arial", 14))
+        tagline_label.setFont(QFont("Arial", 16, QFont.Bold))
         tagline_label.setStyleSheet("color: #666666;")
         tagline_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(tagline_label)
