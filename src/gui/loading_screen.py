@@ -1,6 +1,6 @@
 """
 Loading Screen Widget
-Displays logo during 30-second startup with smooth animations
+Displays logo during 5-second startup with smooth animations
 """
 
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QLabel, QProgressBar, QGraphicsDropShadowEffect
@@ -58,7 +58,7 @@ class LoadingScreen(QWidget):
     
     def init_ui(self):
         self.setWindowTitle("Anilag - Loading")
-        self.setFixedSize(600, 500)
+        self.setFixedSize(600, 550)
         self.setStyleSheet("""
             QWidget {
                 background-color: #f5f5f5;
@@ -70,7 +70,7 @@ class LoadingScreen(QWidget):
         
         layout = QVBoxLayout()
         layout.setAlignment(Qt.AlignCenter)
-        layout.setSpacing(25)
+        layout.setSpacing(15)
         layout.setContentsMargins(40, 40, 40, 40)
         
         # Logo container with shadow effect
@@ -107,6 +107,9 @@ class LoadingScreen(QWidget):
         
         layout.addWidget(self.logo_container, alignment=Qt.AlignCenter)
         
+        # Add spacing after logo
+        layout.addSpacing(60)
+        
         # Tagline
         tagline_label = QLabel("Rice Weevil Detection System")
         tagline_label.setFont(QFont("Arial", 16, QFont.Bold))
@@ -114,12 +117,18 @@ class LoadingScreen(QWidget):
         tagline_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(tagline_label)
         
+        # Add spacing after tagline
+        layout.addSpacing(10)
+        
         # Subtitle/version
         version_label = QLabel("v1.0.0")
         version_label.setFont(QFont("Arial", 11))
         version_label.setStyleSheet("color: #999999;")
         version_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(version_label)
+        
+        # Add spacing after version
+        layout.addSpacing(30)
         
         # Loading status text
         self.loading_label = QLabel("Initializing...")
@@ -185,8 +194,8 @@ class LoadingScreen(QWidget):
         pass
     
     def setup_timer(self):
-        """Setup 30-second loading timer with smooth updates"""
-        self.loading_duration = 30.0  # seconds
+        """Setup fast loading timer with smooth updates"""
+        self.loading_duration = 5.0  # seconds
         self.elapsed_time = 0.0
         self.update_interval = 100  # ms
         
