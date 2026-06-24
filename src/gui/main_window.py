@@ -174,14 +174,29 @@ class MainWindow(QMainWindow):
         else:
             logo_label.setText("ANILAG")
             logo_label.setFont(QFont("Arial", 20, QFont.Bold))
-            logo_label.setStyleSheet("color: #0066cc;")
+            logo_label.setStyleSheet("color: #2E7D32;")
         header_layout.addWidget(logo_label)
         
+        # Title and tagline container
+        title_container = QWidget()
+        title_layout = QVBoxLayout()
+        title_layout.setContentsMargins(0, 0, 0, 0)
+        title_layout.setSpacing(2)
+        title_container.setLayout(title_layout)
+        
         # Title label
-        title_label = QLabel("Rice Weevil Detection System")
-        title_label.setFont(QFont("Arial", 18, QFont.Bold))
-        title_label.setStyleSheet("color: #333;")
-        header_layout.addWidget(title_label)
+        title_label = QLabel("Anilag")
+        title_label.setFont(QFont("Arial", 22, QFont.Bold))
+        title_label.setStyleSheet("color: #2E7D32;")
+        title_layout.addWidget(title_label)
+        
+        # Tagline label
+        tagline_label = QLabel("Rice Weevil Detection System")
+        tagline_label.setFont(QFont("Arial", 11))
+        tagline_label.setStyleSheet("color: #666;")
+        title_layout.addWidget(tagline_label)
+        
+        header_layout.addWidget(title_container)
         
         header_layout.addStretch()
         main_layout.addWidget(header_widget)
@@ -822,10 +837,25 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     
+    # Show loading screen first
+    logo_path = os.path.join(os.path.dirname(__file__), '..', '..', 'assets', 'logo.png')
+    from src.gui.loading_screen import LoadingScreen
+    loading_screen = LoadingScreen(logo_path)
+    loading_screen.show()
+    
+    # Create main window but don't show it yet
     window = MainWindow()
-    window.show()
+    
+    # Connect loading screen completion to show main window
+    loading_screen.loading_complete.connect(lambda: show_main_window(loading_screen, window))
     
     sys.exit(app.exec_())
+
+
+def show_main_window(loading_screen, main_window):
+    """Transition from loading screen to main window"""
+    loading_screen.close()
+    main_window.show()
 
 
 if __name__ == '__main__':
