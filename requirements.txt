@@ -5,7 +5,4 @@ opencv-python-headless==4.9.0.80
 numpy==1.26.4
 pillow==10.3.0
 pyserial==3.5
-rpi_ws281x==4.0.0
-w1thermsensor==2.0.0
-smtplib-ssl==1.0.0
 python-dotenv==1.0.1
