@@ -1,0 +1,11 @@
+{
+    "scan_start_time": "2026-06-24 16:13:02",
+    "scan_end_time": "2026-06-24 16:13:35",
+    "max_weevil_count": 0,
+    "average_temperature_celsius": null,
+    "temperature_readings_count": 0,
+    "videos": {
+        "left_camera": "left_camera.mp4",
+        "right_camera": "right_camera.mp4"
+    }
+}
