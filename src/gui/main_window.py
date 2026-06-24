@@ -2,7 +2,8 @@ import sys
 import cv2
 import numpy as np
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QPushButton, QLabel, QFrame, QTextEdit, QGridLayout, QGroupBox)
+                             QPushButton, QLabel, QFrame, QTextEdit, QGridLayout, QGroupBox,
+                             QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread
 from PyQt5.QtGui import QImage, QPixmap, QFont, QIcon
 from typing import Optional
@@ -111,6 +112,9 @@ class MainWindow(QMainWindow):
         self.is_scanning = False
         self.is_after_mixing = False
         
+        # Detection data for table
+        self.detection_data = []  # List of tuples: (timestamp, count, temperature, recommendation)
+        
         # Setup UI
         self.init_ui()
         self.initialize_components()
@@ -119,63 +123,95 @@ class MainWindow(QMainWindow):
         self.temp_timer = QTimer()
         self.temp_timer.timeout.connect(self.update_temperature)
         self.temp_timer.start(1000)  # Update every second
+        
+        # Setup clock update timer
+        self.clock_timer = QTimer()
+        self.clock_timer.timeout.connect(self.update_clock)
+        self.clock_timer.start(1000)  # Update every second
 
     def init_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
-        main_layout = QHBoxLayout()
+        main_layout = QVBoxLayout()
         central_widget.setLayout(main_layout)
         
-        # Left panel - Camera feeds
+        # Create header with logo
+        header_widget = QWidget()
+        header_layout = QHBoxLayout()
+        header_widget.setLayout(header_layout)
+        header_widget.setStyleSheet("background-color: #f5f5f5; border-bottom: 2px solid #ddd;")
+        header_widget.setMaximumHeight(80)
+        
+        # Logo label
+        logo_label = QLabel()
+        logo_path = os.path.join(os.path.dirname(__file__), '..', '..', 'assets', 'logo.png')
+        if os.path.exists(logo_path):
+            pixmap = QPixmap(logo_path)
+            pixmap = pixmap.scaled(60, 60, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            logo_label.setPixmap(pixmap)
+        else:
+            logo_label.setText("ANILAG")
+            logo_label.setFont(QFont("Arial", 20, QFont.Bold))
+            logo_label.setStyleSheet("color: #0066cc;")
+        header_layout.addWidget(logo_label)
+        
+        # Title label
+        title_label = QLabel("Rice Weevil Detection System")
+        title_label.setFont(QFont("Arial", 18, QFont.Bold))
+        title_label.setStyleSheet("color: #333;")
+        header_layout.addWidget(title_label)
+        
+        header_layout.addStretch()
+        main_layout.addWidget(header_widget)
+        
+        # Create tab widget
+        self.tab_widget = QTabWidget()
+        main_layout.addWidget(self.tab_widget)
+        
+        # Create Live Feed tab
+        self.live_feed_tab = QWidget()
+        self.setup_live_feed_tab()
+        self.tab_widget.addTab(self.live_feed_tab, "Live Feed")
+        
+        # Create Detection Information tab
+        self.detection_info_tab = QWidget()
+        self.setup_detection_info_tab()
+        self.tab_widget.addTab(self.detection_info_tab, "Detection Information")
+        
+        # Status bar
+        self.status_label = QLabel("Ready")
+        self.statusBar().addWidget(self.status_label)
+
+    def setup_live_feed_tab(self):
+        layout = QHBoxLayout()
+        self.live_feed_tab.setLayout(layout)
+        
+        # Left panel - Camera feeds (large) and controls below
         left_panel = QVBoxLayout()
-        main_layout.addLayout(left_panel, stretch=2)
+        layout.addLayout(left_panel, stretch=3)
         
-        # Camera feeds container
+        # Camera feeds container - larger
         camera_container = QHBoxLayout()
-        left_panel.addLayout(camera_container)
+        left_panel.addLayout(camera_container, stretch=3)
         
-        # Left camera feed label
+        # Left camera feed label - larger
         self.left_camera_label = QLabel()
-        self.left_camera_label.setMinimumSize(320, 240)
+        self.left_camera_label.setMinimumSize(640, 480)
         self.left_camera_label.setStyleSheet("border: 2px solid #333; background-color: #000;")
         self.left_camera_label.setAlignment(Qt.AlignCenter)
         self.left_camera_label.setText("Left Camera")
         camera_container.addWidget(self.left_camera_label)
         
-        # Right camera feed label
+        # Right camera feed label - larger
         self.right_camera_label = QLabel()
-        self.right_camera_label.setMinimumSize(320, 240)
+        self.right_camera_label.setMinimumSize(640, 480)
         self.right_camera_label.setStyleSheet("border: 2px solid #333; background-color: #000;")
         self.right_camera_label.setAlignment(Qt.AlignCenter)
         self.right_camera_label.setText("Right Camera")
         camera_container.addWidget(self.right_camera_label)
         
-        # Detection info
-        detection_group = QGroupBox("Detection Information")
-        detection_layout = QGridLayout()
-        
-        self.count_label = QLabel("Weevil Count: 0")
-        self.count_label.setFont(QFont("Arial", 14, QFont.Bold))
-        detection_layout.addWidget(self.count_label, 0, 0)
-        
-        self.temp_label = QLabel("Temperature: --°C")
-        self.temp_label.setFont(QFont("Arial", 12))
-        detection_layout.addWidget(self.temp_label, 0, 1)
-        
-        self.recommendation_label = QLabel("Recommendation: --")
-        self.recommendation_label.setFont(QFont("Arial", 12, QFont.Bold))
-        self.recommendation_label.setStyleSheet("color: #0066cc;")
-        detection_layout.addWidget(self.recommendation_label, 1, 0, 1, 2)
-        
-        detection_group.setLayout(detection_layout)
-        left_panel.addWidget(detection_group)
-        
-        # Right panel - Controls and Logs
-        right_panel = QVBoxLayout()
-        main_layout.addLayout(right_panel, stretch=1)
-        
-        # Scan controls
+        # Scan controls below camera feeds
         scan_group = QGroupBox("Scan Controls")
         scan_layout = QVBoxLayout()
         
@@ -216,9 +252,9 @@ class MainWindow(QMainWindow):
         scan_layout.addWidget(self.mixing_button)
         
         scan_group.setLayout(scan_layout)
-        right_panel.addWidget(scan_group)
+        left_panel.addWidget(scan_group)
         
-        # LED controls
+        # LED controls below scan controls
         led_group = QGroupBox("LED Controls")
         led_layout = QHBoxLayout()
         
@@ -269,23 +305,68 @@ class MainWindow(QMainWindow):
         led_layout.addWidget(self.led_off_button)
         
         led_group.setLayout(led_layout)
-        right_panel.addWidget(led_group)
+        left_panel.addWidget(led_group)
         
-        # Log display
+        # Right panel - Compact detection log
+        right_panel = QVBoxLayout()
+        layout.addLayout(right_panel, stretch=1)
+        
+        # Detection log display - compact
         log_group = QGroupBox("Detection Log")
         log_layout = QVBoxLayout()
         
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(200)
         log_layout.addWidget(self.log_text)
         
         log_group.setLayout(log_layout)
         right_panel.addWidget(log_group)
+
+    def setup_detection_info_tab(self):
+        layout = QVBoxLayout()
+        self.detection_info_tab.setLayout(layout)
         
-        # Status bar
-        self.status_label = QLabel("Ready")
-        self.statusBar().addWidget(self.status_label)
+        # Real-time clock display
+        clock_label = QLabel()
+        clock_label.setAlignment(Qt.AlignCenter)
+        clock_label.setFont(QFont("Arial", 16, QFont.Bold))
+        clock_label.setStyleSheet("background-color: #f0f0f0; padding: 10px; border-radius: 5px;")
+        self.clock_label = clock_label
+        layout.addWidget(clock_label)
+        
+        # Current detection info
+        current_info_group = QGroupBox("Current Detection")
+        current_info_layout = QGridLayout()
+        
+        self.count_label = QLabel("Weevil Count: 0")
+        self.count_label.setFont(QFont("Arial", 14, QFont.Bold))
+        current_info_layout.addWidget(self.count_label, 0, 0)
+        
+        self.temp_label = QLabel("Temperature: --°C")
+        self.temp_label.setFont(QFont("Arial", 12))
+        current_info_layout.addWidget(self.temp_label, 0, 1)
+        
+        self.recommendation_label = QLabel("Recommendation: --")
+        self.recommendation_label.setFont(QFont("Arial", 12, QFont.Bold))
+        self.recommendation_label.setStyleSheet("color: #0066cc;")
+        current_info_layout.addWidget(self.recommendation_label, 1, 0, 1, 2)
+        
+        current_info_group.setLayout(current_info_layout)
+        layout.addWidget(current_info_group)
+        
+        # Detection history table
+        table_group = QGroupBox("Detection History")
+        table_layout = QVBoxLayout()
+        
+        self.detection_table = QTableWidget()
+        self.detection_table.setColumnCount(4)
+        self.detection_table.setHorizontalHeaderLabels(["Timestamp", "Count", "Temperature", "Recommendation"])
+        self.detection_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.detection_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table_layout.addWidget(self.detection_table)
+        
+        table_group.setLayout(table_layout)
+        layout.addWidget(table_group)
 
     def initialize_components(self):
         # Initialize detector
@@ -468,6 +549,9 @@ class MainWindow(QMainWindow):
         temp_str = f"{temperature:.1f}°C" if temperature is not None else "N/A"
         self.log_message(f"{log_entry.timestamp} - Count: {count}, Temp: {temp_str}, Rec: {log_entry.recommendation}")
         
+        # Add to detection table
+        self.add_detection_to_table(log_entry.timestamp, count, temperature, log_entry.recommendation)
+        
         # Send email notification
         if count > 0 or self.is_after_mixing:
             self.email_notifier.send_detection_alert(
@@ -478,10 +562,35 @@ class MainWindow(QMainWindow):
                 activity
             )
 
+    def add_detection_to_table(self, timestamp: str, count: int, temperature: Optional[float], recommendation: str):
+        temp_str = f"{temperature:.1f}°C" if temperature is not None else "N/A"
+        
+        row_position = self.detection_table.rowCount()
+        self.detection_table.insertRow(row_position)
+        
+        self.detection_table.setItem(row_position, 0, QTableWidgetItem(timestamp))
+        self.detection_table.setItem(row_position, 1, QTableWidgetItem(str(count)))
+        self.detection_table.setItem(row_position, 2, QTableWidgetItem(temp_str))
+        self.detection_table.setItem(row_position, 3, QTableWidgetItem(recommendation))
+        
+        # Auto-scroll to bottom
+        self.detection_table.scrollToBottom()
+        
+        # Limit table to last 100 entries
+        if self.detection_table.rowCount() > 100:
+            self.detection_table.removeRow(0)
+
     def update_temperature(self):
         temperature = self.temp_sensor.read_temperature()
         if temperature is not None:
             self.temp_label.setText(f"Temperature: {temperature:.1f}°C")
+    
+    def update_clock(self):
+        from datetime import datetime
+        now = datetime.now()
+        date_str = now.strftime("%Y-%m-%d")
+        time_str = now.strftime("%H:%M:%S")
+        self.clock_label.setText(f"{date_str}  {time_str}")
 
     def log_message(self, message: str):
         self.log_text.append(message)
