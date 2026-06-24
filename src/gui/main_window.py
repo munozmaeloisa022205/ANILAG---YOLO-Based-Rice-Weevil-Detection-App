@@ -4,13 +4,13 @@ import numpy as np
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLabel, QFrame, QTextEdit, QGridLayout, QGroupBox)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread
-from PyQt5.QtGui import QImage, QPixmap, QFont
+from PyQt5.QtGui import QImage, QPixmap, QFont, QIcon
 from typing import Optional
 import os
 from dotenv import load_dotenv
 
 # Import modules
-from src.hardware.camera import Camera
+from src.hardware.camera import Camera, DualCameraManager
 from src.hardware.temperature import TemperatureSensor
 from src.hardware.led_controller import LEDController
 from src.detection.yolov11_detector import YOLOv11Detector, DetectionResult
@@ -19,27 +19,44 @@ from src.notification.email_notifier import EmailNotifier
 
 
 class DetectionThread(QThread):
-    frame_ready = pyqtSignal(np.ndarray, DetectionResult)
+    frame_ready_left = pyqtSignal(np.ndarray, DetectionResult)
+    frame_ready_right = pyqtSignal(np.ndarray, DetectionResult)
     detection_update = pyqtSignal(int, float, str)
 
-    def __init__(self, camera: Camera, detector: YOLOv11Detector):
+    def __init__(self, camera_manager: DualCameraManager, detector: YOLOv11Detector):
         super().__init__()
-        self.camera = camera
+        self.camera_manager = camera_manager
         self.detector = detector
         self.running = False
 
     def run(self):
         self.running = True
         while self.running:
-            frame = self.camera.get_frame()
-            if frame is not None:
-                detection = self.detector.detect(frame)
-                self.frame_ready.emit(frame, detection)
-                self.detection_update.emit(
-                    detection.count,
-                    0.0,  # Placeholder for confidence
-                    "Detection"
-                )
+            left_frame = self.camera_manager.get_left_frame()
+            right_frame = self.camera_manager.get_right_frame()
+            
+            if left_frame is not None:
+                detection_left = self.detector.detect(left_frame)
+                self.frame_ready_left.emit(left_frame, detection_left)
+            
+            if right_frame is not None:
+                detection_right = self.detector.detect(right_frame)
+                self.frame_ready_right.emit(right_frame, detection_right)
+            
+            # Emit combined detection update
+            total_count = 0
+            if left_frame is not None:
+                detection_left = self.detector.detect(left_frame)
+                total_count += detection_left.count
+            if right_frame is not None:
+                detection_right = self.detector.detect(right_frame)
+                total_count += detection_right.count
+            
+            self.detection_update.emit(
+                total_count,
+                0.0,  # Placeholder for confidence
+                "Detection"
+            )
             self.msleep(50)  # 20 FPS
 
     def stop(self):
@@ -53,15 +70,22 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Anilag - Rice Weevil Detection System")
         self.setGeometry(100, 100, 1200, 800)
         
+        # Set window icon
+        icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'assets', 'logo.png')
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+        
         # Load configuration
         load_dotenv('config.env')
         
         # Initialize components
-        self.camera = Camera(
-            camera_id=int(os.getenv('CAMERA_ID', '0')),
+        self.camera_manager = DualCameraManager(
+            left_camera_id=int(os.getenv('LEFT_CAMERA_ID', '0')),
+            right_camera_id=int(os.getenv('RIGHT_CAMERA_ID', '1')),
             width=int(os.getenv('CAMERA_WIDTH', '640')),
             height=int(os.getenv('CAMERA_HEIGHT', '480')),
-            fps=int(os.getenv('CAMERA_FPS', '30'))
+            fps=int(os.getenv('CAMERA_FPS', '30')),
+            camera_type=os.getenv('CAMERA_TYPE', 'opencv')
         )
         
         self.detector = YOLOv11Detector(
@@ -103,17 +127,29 @@ class MainWindow(QMainWindow):
         main_layout = QHBoxLayout()
         central_widget.setLayout(main_layout)
         
-        # Left panel - Camera feed
+        # Left panel - Camera feeds
         left_panel = QVBoxLayout()
         main_layout.addLayout(left_panel, stretch=2)
         
-        # Camera feed label
-        self.camera_label = QLabel()
-        self.camera_label.setMinimumSize(640, 480)
-        self.camera_label.setStyleSheet("border: 2px solid #333; background-color: #000;")
-        self.camera_label.setAlignment(Qt.AlignCenter)
-        self.camera_label.setText("Camera Feed - Click Start Scan")
-        left_panel.addWidget(self.camera_label)
+        # Camera feeds container
+        camera_container = QHBoxLayout()
+        left_panel.addLayout(camera_container)
+        
+        # Left camera feed label
+        self.left_camera_label = QLabel()
+        self.left_camera_label.setMinimumSize(320, 240)
+        self.left_camera_label.setStyleSheet("border: 2px solid #333; background-color: #000;")
+        self.left_camera_label.setAlignment(Qt.AlignCenter)
+        self.left_camera_label.setText("Left Camera")
+        camera_container.addWidget(self.left_camera_label)
+        
+        # Right camera feed label
+        self.right_camera_label = QLabel()
+        self.right_camera_label.setMinimumSize(320, 240)
+        self.right_camera_label.setStyleSheet("border: 2px solid #333; background-color: #000;")
+        self.right_camera_label.setAlignment(Qt.AlignCenter)
+        self.right_camera_label.setText("Right Camera")
+        camera_container.addWidget(self.right_camera_label)
         
         # Detection info
         detection_group = QGroupBox("Detection Information")
@@ -289,12 +325,13 @@ class MainWindow(QMainWindow):
             self.start_scan()
 
     def start_scan(self):
-        if not self.camera.start():
-            self.log_message("Failed to start camera")
+        if not self.camera_manager.start():
+            self.log_message("Failed to start cameras")
             return
         
-        self.detection_thread = DetectionThread(self.camera, self.detector)
-        self.detection_thread.frame_ready.connect(self.update_frame)
+        self.detection_thread = DetectionThread(self.camera_manager, self.detector)
+        self.detection_thread.frame_ready_left.connect(self.update_left_frame)
+        self.detection_thread.frame_ready_right.connect(self.update_right_frame)
         self.detection_thread.detection_update.connect(self.update_detection)
         self.detection_thread.start()
         
@@ -321,7 +358,7 @@ class MainWindow(QMainWindow):
             self.detection_thread.stop()
             self.detection_thread = None
         
-        self.camera.stop()
+        self.camera_manager.stop()
         
         self.is_scanning = False
         self.start_button.setText("Start Scan")
@@ -384,7 +421,7 @@ class MainWindow(QMainWindow):
         self.log_message("LEDs turned off")
         self.email_notifier.send_activity_log("LED Control", "LEDs turned off")
 
-    def update_frame(self, frame: np.ndarray, detection: DetectionResult):
+    def update_left_frame(self, frame: np.ndarray, detection: DetectionResult):
         # Draw detections on frame
         annotated_frame = self.detector.draw_detections(frame, detection)
         
@@ -396,8 +433,23 @@ class MainWindow(QMainWindow):
         
         # Scale to fit label
         pixmap = QPixmap.fromImage(qt_image)
-        scaled_pixmap = pixmap.scaled(self.camera_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.camera_label.setPixmap(scaled_pixmap)
+        scaled_pixmap = pixmap.scaled(self.left_camera_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.left_camera_label.setPixmap(scaled_pixmap)
+
+    def update_right_frame(self, frame: np.ndarray, detection: DetectionResult):
+        # Draw detections on frame
+        annotated_frame = self.detector.draw_detections(frame, detection)
+        
+        # Convert to QImage
+        rgb_image = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb_image.shape
+        bytes_per_line = ch * w
+        qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        
+        # Scale to fit label
+        pixmap = QPixmap.fromImage(qt_image)
+        scaled_pixmap = pixmap.scaled(self.right_camera_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.right_camera_label.setPixmap(scaled_pixmap)
 
     def update_detection(self, count: int, confidence: float, activity: str):
         # Update count label
@@ -413,7 +465,8 @@ class MainWindow(QMainWindow):
         self.recommendation_label.setText(f"Recommendation: {log_entry.recommendation}")
         
         # Update log display
-        self.log_message(f"{log_entry.timestamp} - Count: {count}, Temp: {temperature:.1f}°C, Rec: {log_entry.recommendation}")
+        temp_str = f"{temperature:.1f}°C" if temperature is not None else "N/A"
+        self.log_message(f"{log_entry.timestamp} - Count: {count}, Temp: {temp_str}, Rec: {log_entry.recommendation}")
         
         # Send email notification
         if count > 0 or self.is_after_mixing:
