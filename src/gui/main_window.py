@@ -23,7 +23,7 @@ from src.backend.database import get_database
 class DetectionThread(QThread):
     frame_ready_left = pyqtSignal(np.ndarray, DetectionResult)
     frame_ready_right = pyqtSignal(np.ndarray, DetectionResult)
-    detection_update = pyqtSignal(int, float, str)
+    detection_update = pyqtSignal(int, float, str, np.ndarray, np.ndarray)  # Added frames for image capture
 
     def __init__(self, camera_manager: DualCameraManager, detector: YOLOv11Detector):
         super().__init__()
@@ -57,7 +57,9 @@ class DetectionThread(QThread):
             self.detection_update.emit(
                 total_count,
                 0.0,  # Placeholder for confidence
-                "Detection"
+                "Detection",
+                left_frame if left_frame is not None else None,
+                right_frame if right_frame is not None else None
             )
             self.msleep(50)  # 20 FPS
 
@@ -135,6 +137,11 @@ class MainWindow(QMainWindow):
         self.scan_max_count = 0
         self.scan_avg_temp = 0.0
         self.scan_temp_readings = []
+        
+        # Image capture settings
+        self.high_weevil_threshold = int(os.getenv('HIGH_WEEVIL_THRESHOLD', '5'))
+        self.last_image_capture_time = None
+        self.image_capture_cooldown = int(os.getenv('IMAGE_CAPTURE_COOLDOWN', '30'))  # seconds between captures
         
         # Setup UI
         self.init_ui()
@@ -241,8 +248,17 @@ class MainWindow(QMainWindow):
         self.left_camera_label.setSizePolicy(self.left_camera_label.sizePolicy().horizontalPolicy(), self.left_camera_label.sizePolicy().verticalPolicy())
         self.left_camera_label.setStyleSheet("border: 2px solid #333; background-color: #000; border-radius: 5px;")
         self.left_camera_label.setAlignment(Qt.AlignCenter)
-        self.left_camera_label.setText("Left Camera")
+        self.left_camera_label.setText("No Signal")
         camera_container.addWidget(self.left_camera_label, stretch=1)
+        
+        # Add label overlay on top of left camera
+        left_camera_title = QLabel("Left Camera")
+        left_camera_title.setFont(QFont("Arial", 12, QFont.Bold))
+        left_camera_title.setStyleSheet("color: white; background-color: rgba(0, 0, 0, 150); padding: 5px; border-radius: 3px;")
+        left_camera_title.setAlignment(Qt.AlignCenter)
+        left_camera_title.setParent(self.left_camera_label)
+        left_camera_title.move(10, 10)
+        left_camera_title.show()
         
         # Right camera feed label - larger
         self.right_camera_label = QLabel()
@@ -250,8 +266,17 @@ class MainWindow(QMainWindow):
         self.right_camera_label.setSizePolicy(self.right_camera_label.sizePolicy().horizontalPolicy(), self.right_camera_label.sizePolicy().verticalPolicy())
         self.right_camera_label.setStyleSheet("border: 2px solid #333; background-color: #000; border-radius: 5px;")
         self.right_camera_label.setAlignment(Qt.AlignCenter)
-        self.right_camera_label.setText("Right Camera")
+        self.right_camera_label.setText("No Signal")
         camera_container.addWidget(self.right_camera_label, stretch=1)
+        
+        # Add label overlay on top of right camera
+        right_camera_title = QLabel("Right Camera")
+        right_camera_title.setFont(QFont("Arial", 12, QFont.Bold))
+        right_camera_title.setStyleSheet("color: white; background-color: rgba(0, 0, 0, 150); padding: 5px; border-radius: 3px;")
+        right_camera_title.setAlignment(Qt.AlignCenter)
+        right_camera_title.setParent(self.right_camera_label)
+        right_camera_title.move(10, 10)
+        right_camera_title.show()
         
         # Scan controls below camera feeds
         scan_group = QGroupBox("Scan Controls")
@@ -388,6 +413,19 @@ class MainWindow(QMainWindow):
         self.recommendation_label.setStyleSheet("color: #0066cc; padding: 8px; background-color: #fff3e0; border-radius: 5px; border: 1px solid #ffe0b2;")
         current_info_layout.addWidget(self.recommendation_label)
         
+        # Time and date display
+        self.date_label = QLabel()
+        self.date_label.setFont(QFont("Arial", 12, QFont.Bold))
+        self.date_label.setStyleSheet("padding: 8px; background-color: #e8f5e9; border-radius: 5px; border: 1px solid #c8e6c9;")
+        self.date_label.setAlignment(Qt.AlignCenter)
+        current_info_layout.addWidget(self.date_label)
+        
+        self.time_label = QLabel()
+        self.time_label.setFont(QFont("Arial", 12, QFont.Bold))
+        self.time_label.setStyleSheet("padding: 8px; background-color: #e8f5e9; border-radius: 5px; border: 1px solid #c8e6c9;")
+        self.time_label.setAlignment(Qt.AlignCenter)
+        current_info_layout.addWidget(self.time_label)
+        
         current_info_group.setLayout(current_info_layout)
         right_panel.addWidget(current_info_group)
         
@@ -411,39 +449,6 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
         self.detection_info_tab.setLayout(layout)
         
-        # Real-time clock display
-        clock_label = QLabel()
-        clock_label.setAlignment(Qt.AlignCenter)
-        clock_label.setFont(QFont("Arial", 16, QFont.Bold))
-        clock_label.setStyleSheet("background-color: #f0f0f0; padding: 12px; border-radius: 8px; border: 1px solid #ddd;")
-        self.clock_label = clock_label
-        layout.addWidget(clock_label)
-        
-        # Current detection info
-        current_info_group = QGroupBox("Current Detection")
-        current_info_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 5px; margin-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
-        current_info_layout = QGridLayout()
-        current_info_layout.setSpacing(10)
-        current_info_layout.setContentsMargins(10, 10, 10, 10)
-        
-        self.count_label = QLabel("Weevil Count: 0")
-        self.count_label.setFont(QFont("Arial", 14, QFont.Bold))
-        self.count_label.setStyleSheet("padding: 8px; background-color: #e8f5e9; border-radius: 5px; border: 1px solid #c8e6c9;")
-        current_info_layout.addWidget(self.count_label, 0, 0)
-        
-        self.temp_label = QLabel("Temperature: --°C")
-        self.temp_label.setFont(QFont("Arial", 12))
-        self.temp_label.setStyleSheet("padding: 8px; background-color: #e3f2fd; border-radius: 5px; border: 1px solid #bbdefb;")
-        current_info_layout.addWidget(self.temp_label, 0, 1)
-        
-        self.recommendation_label = QLabel("Recommendation: --")
-        self.recommendation_label.setFont(QFont("Arial", 12, QFont.Bold))
-        self.recommendation_label.setStyleSheet("color: #0066cc; padding: 8px; background-color: #fff3e0; border-radius: 5px; border: 1px solid #ffe0b2;")
-        current_info_layout.addWidget(self.recommendation_label, 1, 0, 1, 2)
-        
-        current_info_group.setLayout(current_info_layout)
-        layout.addWidget(current_info_group)
-        
         # Detection history table
         table_group = QGroupBox("Detection History")
         table_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 5px; margin-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
@@ -452,7 +457,7 @@ class MainWindow(QMainWindow):
         
         self.detection_table = QTableWidget()
         self.detection_table.setColumnCount(4)
-        self.detection_table.setHorizontalHeaderLabels(["Timestamp", "Count", "Temperature", "Recommendation"])
+        self.detection_table.setHorizontalHeaderLabels(["Date and Timestamp", "Count", "Temperature", "Recommendation"])
         self.detection_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.detection_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.detection_table.setStyleSheet("""
@@ -561,6 +566,9 @@ class MainWindow(QMainWindow):
         self.detection_thread.frame_ready_right.connect(self.update_right_frame)
         self.detection_thread.detection_update.connect(self.update_detection)
         self.detection_thread.start()
+        
+        # Reset image capture tracking
+        self.last_image_capture_time = None
         
         self.is_scanning = True
         self.start_button.setText("Stop Scan")
@@ -727,7 +735,7 @@ class MainWindow(QMainWindow):
         scaled_pixmap = pixmap.scaled(self.right_camera_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.right_camera_label.setPixmap(scaled_pixmap)
 
-    def update_detection(self, count: int, confidence: float, activity: str):
+    def update_detection(self, count: int, confidence: float, activity: str, left_frame: np.ndarray = None, right_frame: np.ndarray = None):
         from datetime import datetime, timedelta
         
         # Update count label (always update real-time)
@@ -742,6 +750,14 @@ class MainWindow(QMainWindow):
                 self.scan_max_count = count
             if temperature is not None:
                 self.scan_temp_readings.append(temperature)
+            
+            # Capture image if weevil count is high and cooldown has passed
+            if count >= self.high_weevil_threshold:
+                current_time = datetime.now()
+                if self.last_image_capture_time is None or \
+                   (current_time - self.last_image_capture_time).total_seconds() >= self.image_capture_cooldown:
+                    self.capture_high_weevil_image(left_frame, right_frame, count, temperature)
+                    self.last_image_capture_time = current_time
         
         # Check if 1 minute has passed since last log
         current_time = datetime.now()
@@ -779,16 +795,25 @@ class MainWindow(QMainWindow):
             
             # Update last log time
             self.last_log_time = current_time
+    
+    def capture_high_weevil_image(self, left_frame: np.ndarray, right_frame: np.ndarray, count: int, temperature: float):
+        """Capture and save images when weevil count is high"""
+        if not self.current_scan_folder:
+            return
         
-        # Send email notification (only on significant events or every 1 minute)
-        if should_log and (count > 0 or self.is_after_mixing):
-            self.email_notifier.send_detection_alert(
-                log_entry.timestamp,
-                count,
-                temperature,
-                log_entry.recommendation,
-                activity
-            )
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Save left camera image
+        if left_frame is not None:
+            left_image_path = os.path.join(self.current_scan_folder, f"high_weevil_left_{timestamp}.jpg")
+            cv2.imwrite(left_image_path, left_frame)
+            self.log_message(f"High weevil count ({count}) - Saved left image: {left_image_path}")
+        
+        # Save right camera image
+        if right_frame is not None:
+            right_image_path = os.path.join(self.current_scan_folder, f"high_weevil_right_{timestamp}.jpg")
+            cv2.imwrite(right_image_path, right_frame)
+            self.log_message(f"High weevil count ({count}) - Saved right image: {right_image_path}")
 
     def add_detection_to_table(self, timestamp: str, count: int, temperature: Optional[float], recommendation: str):
         temp_str = f"{temperature:.1f}°C" if temperature is not None else "N/A"
@@ -816,9 +841,13 @@ class MainWindow(QMainWindow):
     def update_clock(self):
         from datetime import datetime
         now = datetime.now()
-        date_str = now.strftime("%Y-%m-%d")
-        time_str = now.strftime("%H:%M:%S")
-        self.clock_label.setText(f"{date_str}  {time_str}")
+        # Format: June 25, 2026 9:31:45 PM
+        date_str = now.strftime("%B %d, %Y")
+        time_str = now.strftime("%I:%M:%S %p")
+        
+        # Update date and time labels on Live Feed tab
+        self.date_label.setText(f"Date: {date_str}")
+        self.time_label.setText(f"Time: {time_str}")
 
     def log_message(self, message: str):
         self.log_text.append(message)
