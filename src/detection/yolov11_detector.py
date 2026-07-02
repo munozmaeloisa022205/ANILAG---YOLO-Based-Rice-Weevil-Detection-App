@@ -3,6 +3,8 @@ import numpy as np
 from typing import List, Dict, Optional, Tuple
 from ultralytics import YOLO
 import threading
+import os
+import platform
 
 
 class DetectionResult:
@@ -17,6 +19,15 @@ class DetectionResult:
         return self.count > 0
 
 
+def _is_raspberry_pi() -> bool:
+    """Detect if running on Raspberry Pi"""
+    try:
+        with open('/proc/device-tree/model', 'r') as f:
+            return 'Raspberry Pi' in f.read()
+    except Exception:
+        return platform.machine() in ('aarch64', 'armv7l')
+
+
 class YOLOv11Detector:
     def __init__(self, model_path: str = 'yolov11n.pt', confidence_threshold: float = 0.5, iou_threshold: float = 0.45):
         self.model_path = model_path
@@ -26,19 +37,38 @@ class YOLOv11Detector:
         self.class_names = []
         self.lock = threading.Lock()
         self.initialized = False
+        # Raspberry Pi 5 optimizations
+        self._is_pi = _is_raspberry_pi()
+        self._device = 'cpu'  # Pi 5 has no CUDA GPU
+        self._imgsz = int(os.getenv('YOLO_IMGSZ', '320'))  # Smaller = faster on Pi 5
 
     def initialize(self) -> bool:
         try:
             with self.lock:
                 self.model = YOLO(self.model_path)
+                self.model.to(self._device)
                 self.class_names = self.model.names
                 self.initialized = True
                 print(f"YOLOv11 model loaded from {self.model_path}")
+                print(f"Running on: {'Raspberry Pi (CPU)' if self._is_pi else 'CPU'}")
+                print(f"Inference image size: {self._imgsz}")
                 print(f"Classes: {self.class_names}")
                 return True
         except Exception as e:
             print(f"YOLO model initialization error: {e}")
             return False
+
+    def export_to_ncnn(self) -> Optional[str]:
+        """Export model to NCNN format for faster inference on Raspberry Pi 5 ARM CPU.
+        Call this once on first setup. Returns path to exported model or None on failure."""
+        try:
+            model = YOLO(self.model_path)
+            ncnn_path = model.export(format='ncnn', imgsz=self._imgsz)
+            print(f"NCNN model exported to: {ncnn_path}")
+            return ncnn_path
+        except Exception as e:
+            print(f"NCNN export error: {e}")
+            return None
 
     def detect(self, frame: np.ndarray) -> DetectionResult:
         if not self.initialized or self.model is None:
@@ -50,6 +80,8 @@ class YOLOv11Detector:
                     frame,
                     conf=self.confidence_threshold,
                     iou=self.iou_threshold,
+                    imgsz=self._imgsz,
+                    device=self._device,
                     verbose=False
                 )
             
