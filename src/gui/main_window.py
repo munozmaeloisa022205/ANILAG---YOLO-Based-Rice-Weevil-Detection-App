@@ -111,8 +111,11 @@ class MainWindow(QMainWindow):
         self.logger = DetectionLogger(log_file=os.getenv('LOG_FILE', 'logs/detection_log.csv'))
         self.email_notifier = EmailNotifier('config.env')
         
-        # Initialize database
-        self.db = get_database(os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'anilag.db'))
+        # Initialize database - use external SSD path if configured
+        _default_db = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'anilag.db')
+        _db_storage = os.getenv('DB_STORAGE_PATH', '').strip()
+        _db_path = os.path.join(_db_storage, 'anilag.db') if _db_storage else _default_db
+        self.db = get_database(_db_path)
         
         self.detection_thread: Optional[DetectionThread] = None
         self.is_scanning = False
@@ -129,7 +132,9 @@ class MainWindow(QMainWindow):
         self.video_writer_right = None
         self.current_scan_folder = None
         self.current_scan_id = None
-        self.previous_scans_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'previous_scans')
+        _default_scans_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'previous_scans')
+        _scan_storage = os.getenv('SCAN_STORAGE_PATH', '').strip()
+        self.previous_scans_dir = os.path.join(_scan_storage, 'previous_scans') if _scan_storage else _default_scans_dir
         os.makedirs(self.previous_scans_dir, exist_ok=True)
         
         # Scan metadata
