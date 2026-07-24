@@ -36,24 +36,19 @@ class DetectionThread(QThread):
         while self.running:
             left_frame = self.camera_manager.get_left_frame()
             right_frame = self.camera_manager.get_right_frame()
-            
-            if left_frame is not None:
-                detection_left = self.detector.detect(left_frame)
-                self.frame_ready_left.emit(left_frame, detection_left)
-            
-            if right_frame is not None:
-                detection_right = self.detector.detect(right_frame)
-                self.frame_ready_right.emit(right_frame, detection_right)
-            
+
             # Emit combined detection update
             total_count = 0
             if left_frame is not None:
                 detection_left = self.detector.detect(left_frame)
                 total_count += detection_left.count
+                self.frame_ready_left.emit(left_frame, detection_left)
+
             if right_frame is not None:
                 detection_right = self.detector.detect(right_frame)
                 total_count += detection_right.count
-            
+                self.frame_ready_right.emit(right_frame, detection_right)
+
             self.detection_update.emit(
                 total_count,
                 0.0,  # Placeholder for confidence
@@ -88,8 +83,7 @@ class MainWindow(QMainWindow):
             right_camera_id=int(os.getenv('RIGHT_CAMERA_ID', '1')),
             width=int(os.getenv('CAMERA_WIDTH', '640')),
             height=int(os.getenv('CAMERA_HEIGHT', '480')),
-            fps=int(os.getenv('CAMERA_FPS', '30')),
-            camera_type=os.getenv('CAMERA_TYPE', 'opencv')
+            fps=int(os.getenv('CAMERA_FPS', '30'))
         )
         
         self.detector = YOLOv11Detector(
@@ -326,7 +320,24 @@ class MainWindow(QMainWindow):
         """)
         self.view_scans_button.clicked.connect(self.view_previous_scans)
         scan_layout.addWidget(self.view_scans_button)
-        
+
+        self.mixing_button = QPushButton("Mark as After Mixing/Sifting")
+        self.mixing_button.setMinimumHeight(40)
+        self.mixing_button.setStyleSheet("""
+            QPushButton {
+                background-color: #FF9800;
+                color: white;
+                font-size: 13px;
+                border-radius: 5px;
+                padding: 6px;
+            }
+            QPushButton:hover {
+                background-color: #F57C00;
+            }
+        """)
+        self.mixing_button.clicked.connect(self.toggle_mixing_state)
+        scan_layout.addWidget(self.mixing_button)
+
         scan_group.setLayout(scan_layout)
         left_panel.addWidget(scan_group)
         
@@ -545,16 +556,21 @@ class MainWindow(QMainWindow):
         height = int(os.getenv('CAMERA_HEIGHT', '480'))
         fps = int(os.getenv('CAMERA_FPS', '30'))
         
-        # Use H.264 codec for better compression
-        fourcc = cv2.VideoWriter_fourcc(*'avc1')  # H.264 codec
-        if fourcc == -1:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Fallback
-        
         left_video_path = os.path.join(self.current_scan_folder, "left_camera.mp4")
         right_video_path = os.path.join(self.current_scan_folder, "right_camera.mp4")
-        
+
+        # Use H.264 codec for better compression; fall back to mp4v if unavailable.
+        fourcc = cv2.VideoWriter_fourcc(*'avc1')
         self.video_writer_left = cv2.VideoWriter(left_video_path, fourcc, fps, (width, height))
+        if not self.video_writer_left.isOpened():
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self.video_writer_left = cv2.VideoWriter(left_video_path, fourcc, fps, (width, height))
+
+        fourcc = cv2.VideoWriter_fourcc(*'avc1')
         self.video_writer_right = cv2.VideoWriter(right_video_path, fourcc, fps, (width, height))
+        if not self.video_writer_right.isOpened():
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self.video_writer_right = cv2.VideoWriter(right_video_path, fourcc, fps, (width, height))
         
         # Reset scan metadata
         self.scan_start_time = datetime.now()
@@ -664,7 +680,7 @@ class MainWindow(QMainWindow):
             self.current_scan_id,
             end_time_str,
             self.scan_max_count,
-            round(avg_temp, 2) if avg_temp else None,
+            round(avg_temp, 2) if avg_temp is not None else None,
             len(self.scan_temp_readings)
         )
         
@@ -673,7 +689,7 @@ class MainWindow(QMainWindow):
             "scan_start_time": self.scan_start_time.strftime("%Y-%m-%d %H:%M:%S") if self.scan_start_time else None,
             "scan_end_time": end_time_str,
             "max_weevil_count": self.scan_max_count,
-            "average_temperature_celsius": round(avg_temp, 2) if avg_temp else None,
+            "average_temperature_celsius": round(avg_temp, 2) if avg_temp is not None else None,
             "temperature_readings_count": len(self.scan_temp_readings),
             "videos": {
                 "left_camera": "left_camera.mp4",
@@ -696,6 +712,36 @@ class MainWindow(QMainWindow):
         self.led_controller.set_white()
         self.log_message("White light activated")
         self.email_notifier.send_activity_log("LED Control", "White light activated for detection")
+
+    def toggle_mixing_state(self):
+        self.is_after_mixing = not self.is_after_mixing
+        if self.is_after_mixing:
+            self.mixing_button.setText("After Mixing: ON")
+            self.mixing_button.setStyleSheet("""
+                QPushButton {
+                    background-color: #4CAF50;
+                    color: white;
+                    font-size: 13px;
+                    border-radius: 5px;
+                    padding: 6px;
+                }
+            """)
+            self.log_message("Marked as after mixing/sifting")
+        else:
+            self.mixing_button.setText("Mark as After Mixing/Sifting")
+            self.mixing_button.setStyleSheet("""
+                QPushButton {
+                    background-color: #FF9800;
+                    color: white;
+                    font-size: 13px;
+                    border-radius: 5px;
+                    padding: 6px;
+                }
+                QPushButton:hover {
+                    background-color: #F57C00;
+                }
+            """)
+            self.log_message("Marked as before mixing/sifting")
 
     def set_leds_off(self):
         self.led_controller.off()

@@ -265,23 +265,23 @@ class LEDController:
     def initialize(self) -> bool:
         try:
             from rpi_ws281x import PixelStrip, ws
-            
-            LED_STRIP = ws.WS2813_STRIP
+
             LED_CHANNEL = 0
-            
+            # WS2813 uses the same protocol as WS2812; fall back gracefully
+            # if a WS2813-specific constant is not present in this rpi_ws281x build.
+            LED_STRIP = getattr(ws, 'WS2813_STRIP', ws.WS2812_STRIP)
+
             self.strip = PixelStrip(
-                self.led_count,
-                self.gpio_pin,
-                LED_CHANNEL,
-                None,
-                LED_STRIP,
-                800000,
-                5,
-                self.brightness,
-                255,
-                0
+                num=self.led_count,
+                pin=self.gpio_pin,
+                freq_hz=800000,
+                dma=10,
+                invert=False,
+                brightness=self.brightness,
+                strip_type=LED_STRIP,
+                channel=LED_CHANNEL
             )
-            
+
             self.strip.begin()
             self.initialized = True
             return True
@@ -414,7 +414,9 @@ class EmailNotifier:
         self.sender_email = os.getenv('EMAIL_SENDER', '')
         self.sender_password = os.getenv('EMAIL_PASSWORD', '')
         self.recipient_email = os.getenv('EMAIL_RECIPIENT', '')
-        self.enabled = bool(self.sender_email and self.sender_password and self.recipient_email)
+        email_enabled_env = os.getenv('EMAIL_ENABLED', 'true').lower()
+        self.email_enabled = email_enabled_env in ('true', '1', 'yes', 'on')
+        self.enabled = self.email_enabled and bool(self.sender_email and self.sender_password and self.recipient_email)
 
     def initialize(self) -> bool:
         if not self.enabled:
@@ -864,8 +866,9 @@ class MainWindow(QMainWindow):
         log_entry = self.logger.log_detection(count, temperature, self.is_after_mixing, activity)
         
         self.recommendation_label.setText(f"Recommendation: {log_entry.recommendation}")
-        
-        self.log_message(f"{log_entry.timestamp} - Count: {count}, Temp: {temperature:.1f}°C, Rec: {log_entry.recommendation}")
+
+        temp_str = f"{temperature:.1f}°C" if temperature is not None else "N/A"
+        self.log_message(f"{log_entry.timestamp} - Count: {count}, Temp: {temp_str}, Rec: {log_entry.recommendation}")
         
         if count > 0 or self.is_after_mixing:
             self.email_notifier.send_detection_alert(

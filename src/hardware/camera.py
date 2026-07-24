@@ -5,14 +5,12 @@ import numpy as np
 
 
 class Camera:
-    def __init__(self, camera_id: int = 0, width: int = 640, height: int = 480, fps: int = 30, camera_type: str = "opencv"):
+    def __init__(self, camera_id: int = 0, width: int = 640, height: int = 480, fps: int = 30):
         self.camera_id = camera_id
         self.width = width
         self.height = height
         self.fps = fps
-        self.camera_type = camera_type  # "opencv" for cv2.VideoCapture, "picamera" for Raspberry Pi camera
         self.cap: Optional[cv2.VideoCapture] = None
-        self.picamera = None  # For Raspberry Pi camera
         self.running = False
         self.frame_callback: Optional[Callable] = None
         self.thread: Optional[threading.Thread] = None
@@ -21,27 +19,10 @@ class Camera:
 
     def initialize(self) -> bool:
         try:
-            if self.camera_type == "picamera":
-                # Raspberry Pi camera initialization
-                try:
-                    from picamera2 import Picamera2
-                    self.picamera = Picamera2(self.camera_id)
-                    config = self.picamera.create_preview_configuration(
-                        main={"size": (self.width, self.height)}
-                    )
-                    self.picamera.configure(config)
-                    self.picamera.start()
-                    return True
-                except ImportError:
-                    print("Picamera2 not available, falling back to OpenCV")
-                    self.camera_type = "opencv"
-                    return self.initialize()
-            
-            # OpenCV initialization (default)
             self.cap = cv2.VideoCapture(self.camera_id)
             if not self.cap.isOpened():
                 return False
-            
+
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
             self.cap.set(cv2.CAP_PROP_FPS, self.fps)
@@ -66,24 +47,14 @@ class Camera:
     def _capture_loop(self):
         while self.running:
             try:
-                if self.camera_type == "picamera" and self.picamera:
-                    frame = self.picamera.capture_array()
-                    if frame is not None:
-                        # Convert RGB to BGR for OpenCV compatibility
-                        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                        with self.lock:
-                            self.current_frame = frame.copy()
-                        if self.frame_callback:
-                            self.frame_callback(frame)
+                ret, frame = self.cap.read()
+                if ret:
+                    with self.lock:
+                        self.current_frame = frame.copy()
+                    if self.frame_callback:
+                        self.frame_callback(frame)
                 else:
-                    ret, frame = self.cap.read()
-                    if ret:
-                        with self.lock:
-                            self.current_frame = frame.copy()
-                        if self.frame_callback:
-                            self.frame_callback(frame)
-                    else:
-                        print("Failed to read frame from camera")
+                    print("Failed to read frame from camera")
             except Exception as e:
                 print(f"Capture loop error: {e}")
                 break
@@ -98,10 +69,6 @@ class Camera:
         self.running = False
         if self.thread:
             self.thread.join(timeout=2.0)
-        if self.picamera:
-            self.picamera.stop()
-            self.picamera.close()
-            self.picamera = None
         if self.cap:
             self.cap.release()
             self.cap = None
@@ -115,10 +82,10 @@ class Camera:
 
 class DualCameraManager:
     """Manages two cameras (left and right) for stereo vision"""
-    def __init__(self, left_camera_id: int = 0, right_camera_id: int = 1, 
-                 width: int = 640, height: int = 480, fps: int = 30, camera_type: str = "opencv"):
-        self.left_camera = Camera(left_camera_id, width, height, fps, camera_type)
-        self.right_camera = Camera(right_camera_id, width, height, fps, camera_type)
+    def __init__(self, left_camera_id: int = 0, right_camera_id: int = 1,
+                 width: int = 640, height: int = 480, fps: int = 30):
+        self.left_camera = Camera(left_camera_id, width, height, fps)
+        self.right_camera = Camera(right_camera_id, width, height, fps)
         self.running = False
 
     def start(self, left_callback: Optional[Callable] = None, right_callback: Optional[Callable] = None) -> bool:
