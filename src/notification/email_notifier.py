@@ -14,7 +14,9 @@ class EmailNotifier:
         self.sender_email = os.getenv('EMAIL_SENDER', '')
         self.sender_password = os.getenv('EMAIL_PASSWORD', '')
         self.recipient_email = os.getenv('EMAIL_RECIPIENT', '')
-        self.enabled = bool(self.sender_email and self.sender_password and self.recipient_email)
+        email_enabled_env = os.getenv('EMAIL_ENABLED', 'true').lower()
+        self.email_enabled = email_enabled_env in ('true', '1', 'yes', 'on')
+        self.enabled = self.email_enabled and bool(self.sender_email and self.sender_password and self.recipient_email)
 
     def initialize(self) -> bool:
         if not self.enabled:

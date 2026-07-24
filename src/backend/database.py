@@ -6,7 +6,7 @@ Stores detection data and scan metadata
 
 import sqlite3
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from contextlib import contextmanager
 import threading
@@ -47,44 +47,12 @@ class DatabaseManager:
                 conn.close()
     
     def _initialize_database(self):
-        """Create tables if they don't exist"""
+        """Create tables and indexes from the SQL schema file."""
+        schema_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'schema.sql')
+        with open(schema_path, 'r') as f:
+            schema_sql = f.read()
         with self._get_connection() as conn:
-            # Scans table - stores scan metadata
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS scans (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    scan_id TEXT UNIQUE NOT NULL,
-                    start_time TEXT NOT NULL,
-                    end_time TEXT NOT NULL,
-                    max_weevil_count INTEGER DEFAULT 0,
-                    avg_temperature_celsius REAL,
-                    temp_readings_count INTEGER DEFAULT 0,
-                    left_video_path TEXT,
-                    right_video_path TEXT,
-                    metadata_json TEXT,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            
-            # Detections table - stores individual detection events
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS detections (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    scan_id TEXT NOT NULL,
-                    timestamp TEXT NOT NULL,
-                    weevil_count INTEGER DEFAULT 0,
-                    temperature_celsius REAL,
-                    recommendation TEXT,
-                    activity TEXT DEFAULT 'Detection',
-                    FOREIGN KEY (scan_id) REFERENCES scans(scan_id)
-                )
-            """)
-            
-            # Create indexes for common queries
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_detections_scan_id ON detections(scan_id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_detections_timestamp ON detections(timestamp)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_scans_start_time ON scans(start_time)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_scans_scan_id ON scans(scan_id)")
+            conn.executescript(schema_sql)
     
     def create_scan(self, scan_id: str, start_time: str, left_video_path: str, 
                     right_video_path: str) -> int:
@@ -230,7 +198,7 @@ class DatabaseManager:
     def cleanup_old_scans(self, days: int = 30) -> int:
         """Delete scans older than specified days"""
         with self._get_connection() as conn:
-            cutoff_date = datetime.now().replace(day=datetime.now().day - days).strftime("%Y-%m-%d")
+            cutoff_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
             cursor = conn.execute(
                 "DELETE FROM scans WHERE start_time < ?", (cutoff_date,)
             )

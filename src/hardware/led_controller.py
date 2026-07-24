@@ -14,23 +14,23 @@ class LEDController:
         try:
             # Import rpi_ws281x only on Raspberry Pi
             from rpi_ws281x import PixelStrip, ws
-            
-            LED_STRIP = ws.WS2813_STRIP
+
             LED_CHANNEL = 0
-            
+            # WS2813 uses the same protocol as WS2812; fall back gracefully
+            # if a WS2813-specific constant is not present in this rpi_ws281x build.
+            LED_STRIP = getattr(ws, 'WS2813_STRIP', ws.WS2812_STRIP)
+
             self.strip = PixelStrip(
-                self.led_count,
-                self.gpio_pin,
-                LED_CHANNEL,
-                None,
-                LED_STRIP,
-                800000,
-                5,
-                self.brightness,
-                255,
-                0
+                num=self.led_count,
+                pin=self.gpio_pin,
+                freq_hz=800000,
+                dma=10,
+                invert=False,
+                brightness=self.brightness,
+                strip_type=LED_STRIP,
+                channel=LED_CHANNEL
             )
-            
+
             self.strip.begin()
             self.initialized = True
             return True

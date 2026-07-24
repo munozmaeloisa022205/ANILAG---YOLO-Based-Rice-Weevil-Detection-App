@@ -1,8 +1,8 @@
 PyQt5==5.15.10
 ultralytics>=8.3.0
 opencv-python==4.9.0.80
-opencv-python-headless==4.9.0.80
 numpy==1.26.4
 pillow==10.3.0
 pyserial==3.5
 python-dotenv==1.0.1
+rpi_ws281x>=4.3.0; platform_machine == "aarch64" or platform_machine == "armv7l"

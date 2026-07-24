@@ -1,10 +1,10 @@
 # Anilag - Rice Weevil Detection System
 
-A PyQt5-based GUI application for detecting rice weevils using YOLOv11n on Raspberry Pi 5 with Camera Module 3.
+A PyQt5-based GUI application for detecting rice weevils using YOLOv11n on Raspberry Pi 5 with USB webcams.
 
 ## Features
 
-- **Live Camera Feed**: Real-time detection from Raspberry Pi Camera Module 3
+- **Live Camera Feed**: Real-time detection from USB webcams
 - **YOLOv11n Detection**: Optimized rice weevil detection model
 - **Temperature Monitoring**: DS18B20 sensor integration for heated rice temperature
 - **LED Control**: WS2813 LED control (red light for luring, white light for detection)
@@ -17,7 +17,7 @@ A PyQt5-based GUI application for detecting rice weevils using YOLOv11n on Raspb
 ## Hardware Requirements
 
 - Raspberry Pi 5
-- Raspberry Pi Camera Module 3
+- USB webcams (left and right)
 - DS18B20 temperature sensor
 - WS2813 5V LED strip
 - Power supply for LED strip
@@ -28,9 +28,7 @@ A PyQt5-based GUI application for detecting rice weevils using YOLOv11n on Raspb
 - PyQt5
 - ultralytics (YOLOv11n)
 - OpenCV
-- RPi.GPIO
 - rpi_ws281x
-- w1thermsensor
 
 ## Installation
 
