@@ -3,11 +3,15 @@ import cv2
 import numpy as np
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLabel, QFrame, QTextEdit, QGridLayout, QGroupBox,
-                             QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView)
+                             QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
+                             QListWidget, QListWidgetItem, QSplitter, QMessageBox,
+                             QFileDialog, QProgressBar)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread
 from PyQt5.QtGui import QImage, QPixmap, QFont, QIcon
 from typing import Optional
 import os
+import time
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 # Import modules
@@ -18,49 +22,81 @@ from src.detection.yolov11_detector import YOLOv11Detector, DetectionResult
 from src.logging.logger import DetectionLogger
 from src.notification.email_notifier import EmailNotifier
 from src.backend.database import get_database
+from src.backend import report_builder
 
 
 class DetectionThread(QThread):
     frame_ready_left = pyqtSignal(np.ndarray, DetectionResult)
     frame_ready_right = pyqtSignal(np.ndarray, DetectionResult)
-    detection_update = pyqtSignal(int, float, str, np.ndarray, np.ndarray)  # Added frames for image capture
+    detection_update = pyqtSignal(int, float, str)
+    stats_update = pyqtSignal(float, float)  # detections per second, avg inference ms
 
-    def __init__(self, camera_manager: DualCameraManager, detector: YOLOv11Detector):
+    def __init__(self, camera_manager: DualCameraManager, detector: YOLOv11Detector,
+                 interval_ms: int = 200):
         super().__init__()
         self.camera_manager = camera_manager
         self.detector = detector
+        # Minimum time between detection cycles. YOLOv11n on the Pi 5 ARM CPU needs
+        # ~20ms (NCNN) to ~120ms (PyTorch) per frame, so a fixed 20 FPS loop would
+        # saturate all four cores and starve the GUI thread.
+        self.interval_ms = max(0, interval_ms)
         self.running = False
 
     def run(self):
         self.running = True
         while self.running:
+            cycle_started = time.perf_counter()
             left_frame = self.camera_manager.get_left_frame()
             right_frame = self.camera_manager.get_right_frame()
 
             # Emit combined detection update
             total_count = 0
+            confidences = []
             if left_frame is not None:
                 detection_left = self.detector.detect(left_frame)
                 total_count += detection_left.count
+                confidences.extend(detection_left.confidences)
                 self.frame_ready_left.emit(left_frame, detection_left)
 
             if right_frame is not None:
                 detection_right = self.detector.detect(right_frame)
                 total_count += detection_right.count
+                confidences.extend(detection_right.confidences)
                 self.frame_ready_right.emit(right_frame, detection_right)
 
-            self.detection_update.emit(
-                total_count,
-                0.0,  # Placeholder for confidence
-                "Detection",
-                left_frame if left_frame is not None else None,
-                right_frame if right_frame is not None else None
-            )
-            self.msleep(50)  # 20 FPS
+            avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
+            self.detection_update.emit(total_count, avg_confidence, "Detection")
+
+            elapsed_ms = (time.perf_counter() - cycle_started) * 1000
+            self.stats_update.emit(1000.0 / elapsed_ms if elapsed_ms > 0 else 0.0,
+                                   self.detector.avg_inference_ms)
+
+            # Throttle so the Pi 5 keeps headroom for the GUI, recording and DB writes
+            remaining = self.interval_ms - elapsed_ms
+            self.msleep(int(remaining) if remaining > 0 else 1)
 
     def stop(self):
         self.running = False
         self.wait()
+
+
+class EmailThread(QThread):
+    """Runs an EmailNotifier call off the UI thread so SMTP never freezes the GUI."""
+    finished_with_status = pyqtSignal(bool, str)
+
+    def __init__(self, description: str, send_func, *args, **kwargs):
+        super().__init__()
+        self.description = description
+        self.send_func = send_func
+        self.args = args
+        self.kwargs = kwargs
+
+    def run(self):
+        success = self.send_func(*self.args, **self.kwargs)
+        if success:
+            self.finished_with_status.emit(True, f"Email sent: {self.description}")
+        else:
+            self.finished_with_status.emit(False, f"Email failed: {self.description} (see console for details)")
 
 
 class MainWindow(QMainWindow):
@@ -87,9 +123,9 @@ class MainWindow(QMainWindow):
         )
         
         self.detector = YOLOv11Detector(
-            model_path=os.getenv('MODEL_PATH', 'models/yolov11n.pt'),
+            model_path=os.getenv('MODEL_PATH', 'models/sitophilus_oryzae_v2-3_best.pt'),
             confidence_threshold=float(os.getenv('CONFIDENCE_THRESHOLD', '0.5')),
-            iou_threshold=float(os.getenv('IOU_THRESHOLD', '0.45'))
+            iou_threshold=float(os.getenv('IOU_THRESHOLD', '0.7'))
         )
         
         self.temp_sensor = TemperatureSensor(
@@ -141,6 +177,25 @@ class MainWindow(QMainWindow):
         self.high_weevil_threshold = int(os.getenv('HIGH_WEEVIL_THRESHOLD', '5'))
         self.last_image_capture_time = None
         self.image_capture_cooldown = int(os.getenv('IMAGE_CAPTURE_COOLDOWN', '30'))  # seconds between captures
+        self.latest_annotated_left = None
+        self.latest_annotated_right = None
+        
+        # Scan protocol: each scan runs for a fixed duration, then auto-stops and emails the report
+        self.scan_duration_seconds = int(os.getenv('SCAN_DURATION_SECONDS', '180'))
+        self.scan_images_dir = None
+        self.email_threads = []
+        # Sparse baseline log interval - guarantees a scan always has log rows, even when
+        # nothing significant is found, so "no weevils" is recorded rather than missing.
+        self.log_interval_seconds = int(os.getenv('LOG_INTERVAL_SECONDS', '60'))
+        # Minimum gap between log rows triggered by a high weevil count
+        self.significant_log_interval_seconds = int(os.getenv('SIGNIFICANT_LOG_INTERVAL_SECONDS', '5'))
+        self.last_significant_log_time = None
+        # Detection cycle interval - throttles YOLO inference on the Pi 5 CPU
+        self.detection_interval_ms = int(os.getenv('DETECTION_INTERVAL_MS', '200'))
+        self.scan_detection_count = 0
+        self.scan_image_count = 0
+        self.reports_dir = os.path.join(self.previous_scans_dir, 'reports')
+        os.makedirs(self.reports_dir, exist_ok=True)
         
         # Setup UI
         self.init_ui()
@@ -155,6 +210,15 @@ class MainWindow(QMainWindow):
         self.clock_timer = QTimer()
         self.clock_timer.timeout.connect(self.update_clock)
         self.clock_timer.start(1000)  # Update every second
+        
+        # Scan protocol timer - stops the scan after the configured duration
+        self.scan_timer = QTimer()
+        self.scan_timer.setSingleShot(True)
+        self.scan_timer.timeout.connect(self.on_scan_duration_elapsed)
+        
+        # Countdown timer for the remaining scan time shown in the status label
+        self.scan_countdown_timer = QTimer()
+        self.scan_countdown_timer.timeout.connect(self.update_scan_countdown)
 
     def init_ui(self):
         central_widget = QWidget()
@@ -205,6 +269,14 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(title_container)
         
         header_layout.addStretch()
+        
+        # Always-visible real-time clock (updated every second from the system clock)
+        self.header_clock_label = QLabel()
+        self.header_clock_label.setFont(QFont("Arial", 13, QFont.Bold))
+        self.header_clock_label.setStyleSheet("color: #2E7D32; padding-right: 6px;")
+        self.header_clock_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        header_layout.addWidget(self.header_clock_label)
+        
         main_layout.addWidget(header_widget)
         
         # Create tab widget
@@ -220,6 +292,11 @@ class MainWindow(QMainWindow):
         self.detection_info_tab = QWidget()
         self.setup_detection_info_tab()
         self.tab_widget.addTab(self.detection_info_tab, "Detection Information")
+        
+        # Create Scan History tab (reads scans, logs and images back from the database)
+        self.scan_history_tab = QWidget()
+        self.setup_scan_history_tab()
+        self.tab_widget.addTab(self.scan_history_tab, "Scan History")
         
         # Status bar
         self.status_label = QLabel("Ready")
@@ -419,6 +496,11 @@ class MainWindow(QMainWindow):
         self.count_label.setStyleSheet("padding: 8px; background-color: #e8f5e9; border-radius: 5px; border: 1px solid #c8e6c9;")
         current_info_layout.addWidget(self.count_label)
         
+        self.confidence_label = QLabel("Avg Confidence: --")
+        self.confidence_label.setFont(QFont("Arial", 11))
+        self.confidence_label.setStyleSheet("padding: 8px; background-color: #e8f5e9; border-radius: 5px; border: 1px solid #c8e6c9;")
+        current_info_layout.addWidget(self.confidence_label)
+        
         self.temp_label = QLabel("Temperature: --°C")
         self.temp_label.setFont(QFont("Arial", 12))
         self.temp_label.setStyleSheet("padding: 8px; background-color: #e3f2fd; border-radius: 5px; border: 1px solid #bbdefb;")
@@ -444,6 +526,40 @@ class MainWindow(QMainWindow):
         
         current_info_group.setLayout(current_info_layout)
         right_panel.addWidget(current_info_group)
+        
+        # YOLOv11n model and inference performance
+        model_group = QGroupBox("Detection Model")
+        model_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 5px; margin-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
+        model_layout = QVBoxLayout()
+        model_layout.setSpacing(6)
+        model_layout.setContentsMargins(10, 10, 10, 10)
+        
+        self.model_label = QLabel("Model: loading...")
+        self.model_label.setFont(QFont("Arial", 10, QFont.Bold))
+        self.model_label.setWordWrap(True)
+        self.model_label.setStyleSheet("padding: 6px; background-color: #ede7f6; border-radius: 5px; border: 1px solid #d1c4e9;")
+        model_layout.addWidget(self.model_label)
+        
+        self.model_detail_label = QLabel("Backend: --")
+        self.model_detail_label.setFont(QFont("Arial", 9))
+        self.model_detail_label.setWordWrap(True)
+        self.model_detail_label.setStyleSheet("padding: 6px; background-color: #f3e5f5; border-radius: 5px; border: 1px solid #e1bee7; color: #444;")
+        model_layout.addWidget(self.model_detail_label)
+        
+        self.performance_label = QLabel("Inference: -- ms   |   Rate: -- /s")
+        self.performance_label.setFont(QFont("Consolas", 9))
+        self.performance_label.setStyleSheet("padding: 6px; background-color: #fff8e1; border-radius: 5px; border: 1px solid #ffecb3;")
+        model_layout.addWidget(self.performance_label)
+        
+        self.model_warning_label = QLabel()
+        self.model_warning_label.setFont(QFont("Arial", 9, QFont.Bold))
+        self.model_warning_label.setWordWrap(True)
+        self.model_warning_label.setStyleSheet("padding: 6px; background-color: #ffebee; border-radius: 5px; border: 1px solid #ef9a9a; color: #b71c1c;")
+        self.model_warning_label.setVisible(False)
+        model_layout.addWidget(self.model_warning_label)
+        
+        model_group.setLayout(model_layout)
+        right_panel.addWidget(model_group)
         
         # Detection log display - compact
         log_group = QGroupBox("Detection Log")
@@ -500,24 +616,148 @@ class MainWindow(QMainWindow):
         table_group.setLayout(table_layout)
         layout.addWidget(table_group)
 
+    def setup_scan_history_tab(self):
+        layout = QVBoxLayout()
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+        self.scan_history_tab.setLayout(layout)
+        
+        table_style = """
+            QTableWidget {
+                border: 1px solid #ddd;
+                border-radius: 3px;
+                background-color: white;
+                gridline-color: #eee;
+            }
+            QTableWidget::item { padding: 5px; border-bottom: 1px solid #eee; }
+            QHeaderView::section {
+                background-color: #f5f5f5;
+                padding: 8px;
+                border: 1px solid #ddd;
+                font-weight: bold;
+                color: #333;
+            }
+        """
+        
+        self.db_status_label = QLabel("Database: --")
+        self.db_status_label.setFont(QFont("Arial", 10, QFont.Bold))
+        self.db_status_label.setStyleSheet("padding: 8px; background-color: #e3f2fd; border-radius: 5px; border: 1px solid #bbdefb;")
+        layout.addWidget(self.db_status_label)
+        
+        splitter = QSplitter(Qt.Horizontal)
+        layout.addWidget(splitter, stretch=1)
+        
+        # Left: stored scans
+        scans_group = QGroupBox("Stored Scans")
+        scans_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 5px; margin-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
+        scans_layout = QVBoxLayout()
+        scans_layout.setContentsMargins(5, 5, 5, 5)
+        
+        self.scan_table = QTableWidget()
+        self.scan_table.setColumnCount(7)
+        self.scan_table.setHorizontalHeaderLabels(
+            ["Scan ID", "Start Time", "Max Count", "Avg Temp", "Log Rows", "Images", "Report"])
+        self.scan_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.scan_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.scan_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.scan_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.scan_table.setStyleSheet(table_style)
+        self.scan_table.itemSelectionChanged.connect(self.on_scan_selected)
+        scans_layout.addWidget(self.scan_table)
+        
+        scans_group.setLayout(scans_layout)
+        splitter.addWidget(scans_group)
+        
+        # Right: images and detection log stored for the selected scan
+        detail_group = QGroupBox("Stored Detection Log and Images")
+        detail_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 5px; margin-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
+        detail_layout = QVBoxLayout()
+        detail_layout.setContentsMargins(5, 5, 5, 5)
+        detail_layout.setSpacing(8)
+        
+        self.image_preview_label = QLabel("Select a scan to preview its stored images")
+        self.image_preview_label.setMinimumHeight(200)
+        self.image_preview_label.setAlignment(Qt.AlignCenter)
+        self.image_preview_label.setStyleSheet("border: 2px solid #333; background-color: #000; color: #999; border-radius: 5px;")
+        detail_layout.addWidget(self.image_preview_label, stretch=2)
+        
+        self.image_list = QListWidget()
+        self.image_list.setMaximumHeight(120)
+        self.image_list.setStyleSheet("font-family: Consolas, monospace; font-size: 10px; border: 1px solid #ddd; border-radius: 3px;")
+        self.image_list.currentRowChanged.connect(self.on_history_image_selected)
+        detail_layout.addWidget(self.image_list, stretch=1)
+        
+        self.history_log_table = QTableWidget()
+        self.history_log_table.setColumnCount(4)
+        self.history_log_table.setHorizontalHeaderLabels(["Timestamp", "Count", "Temp", "Recommendation"])
+        self.history_log_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.history_log_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.history_log_table.setStyleSheet(table_style)
+        detail_layout.addWidget(self.history_log_table, stretch=2)
+        
+        detail_group.setLayout(detail_layout)
+        splitter.addWidget(detail_group)
+        splitter.setSizes([600, 500])
+        
+        # Actions
+        button_row = QHBoxLayout()
+        button_row.setSpacing(8)
+        
+        def make_button(text, color, hover, handler):
+            button = QPushButton(text)
+            button.setMinimumHeight(38)
+            button.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {color};
+                    color: white;
+                    font-size: 13px;
+                    font-weight: bold;
+                    border-radius: 5px;
+                    padding: 6px;
+                }}
+                QPushButton:hover {{ background-color: {hover}; }}
+                QPushButton:disabled {{ background-color: #bdbdbd; }}
+            """)
+            button.clicked.connect(handler)
+            button_row.addWidget(button)
+            return button
+        
+        self.refresh_history_button = make_button("Refresh", "#2196F3", "#1976D2", self.refresh_scan_history)
+        self.resend_report_button = make_button("Email Selected Scan Report", "#4CAF50", "#45a049",
+                                                self.resend_selected_report)
+        self.export_report_button = make_button("Export Zip from Database", "#FF9800", "#F57C00",
+                                                self.export_selected_report)
+        self.open_scans_folder_button = make_button("Open Scans Folder", "#607D8B", "#455A64",
+                                                   self.view_previous_scans)
+        layout.addLayout(button_row)
+
     def initialize_components(self):
         # Initialize detector
         if self.detector.initialize():
-            self.log_message("YOLOv11 detector initialized successfully")
+            info = self.detector.get_model_info()
+            self.log_message(f"YOLOv11n detector initialized: {info['model_name']} "
+                             f"({info['backend']} backend, imgsz={info['imgsz']}, "
+                             f"classes={', '.join(str(c) for c in info['classes']) or 'none'})")
         else:
             self.log_message("Failed to initialize YOLOv11 detector")
+        self.update_model_display()
         
-        # Initialize temperature sensor
+        # Initialize temperature sensor (DS18B20 over 1-Wire, polled in its own thread)
         if self.temp_sensor.initialize():
-            self.log_message("Temperature sensor initialized")
+            status = self.temp_sensor.get_status()
+            self.log_message(f"DS18B20 temperature sensor ready: {status['device_id']} "
+                             f"(polling every {status['poll_interval']:g}s)")
         else:
-            self.log_message("Temperature sensor not available")
+            self.log_message(f"DS18B20 not available - {self.temp_sensor.last_error}")
         
-        # Initialize LED controller
-        if self.led_controller.initialize():
-            self.log_message("LED controller initialized")
+        # Initialize LED controller (WS2813; SPI on Pi 5, rpi_ws281x on Pi 4 and older)
+        self.led_controller.initialize()
+        led_status = self.led_controller.get_status()
+        if led_status['backend'] == 'simulation':
+            self.log_message(f"WS2813 LEDs in simulation mode - {led_status['error']}")
         else:
-            self.log_message("LED controller not available")
+            self.log_message(f"WS2813 LEDs ready: {led_status['led_count']} pixels via "
+                             f"{led_status['backend']}, brightness {led_status['brightness']}")
         
         # Initialize logger
         if self.logger.initialize():
@@ -530,6 +770,38 @@ class MainWindow(QMainWindow):
             self.log_message("Email notifier initialized")
         else:
             self.log_message("Email notifier disabled")
+        
+        # Populate the database-backed history view
+        self.refresh_scan_history()
+
+    def update_model_display(self):
+        """Show which YOLOv11n weights and backend are actually loaded."""
+        info = self.detector.get_model_info()
+        status = "loaded" if info['initialized'] else "NOT LOADED"
+        self.model_label.setText(f"{info['architecture']} - {info['model_name']} ({status})")
+        classes = ', '.join(str(c) for c in info['classes']) or 'none'
+        metrics = info['metrics']
+        self.model_detail_label.setText(
+            f"Backend: {info['backend']}   |   Device: {info['device']}   |   "
+            f"Input: {info['imgsz']}px (trained {info['trained_imgsz']}px)\n"
+            f"Classes: {classes}\n"
+            f"Confidence >= {info['confidence_threshold']}   |   IoU {info['iou_threshold']}   |   "
+            f"Cycle every {self.detection_interval_ms} ms\n"
+            f"Training ({metrics['run']}, {metrics['epochs']} epochs): "
+            f"mAP50 {metrics['mAP50']:.3f}   mAP50-95 {metrics['mAP50-95']:.3f}   "
+            f"P {metrics['precision']:.3f}   R {metrics['recall']:.3f}")
+        
+        warning = info['warning']
+        if not info['initialized']:
+            warning = warning or "Model failed to load - no detections will be recorded."
+        self.model_warning_label.setText(warning or "")
+        self.model_warning_label.setVisible(bool(warning))
+        if warning:
+            self.log_message(f"MODEL WARNING: {warning}")
+
+    def update_performance_stats(self, rate_per_second: float, avg_inference_ms: float):
+        self.performance_label.setText(
+            f"Inference: {avg_inference_ms:6.1f} ms   |   Rate: {rate_per_second:5.1f} /s")
 
     def toggle_scan(self):
         if self.is_scanning:
@@ -543,10 +815,13 @@ class MainWindow(QMainWindow):
             return
         
         # Create scan folder with timestamp
-        from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.current_scan_folder = os.path.join(self.previous_scans_dir, f"scan_{timestamp}")
         os.makedirs(self.current_scan_folder, exist_ok=True)
+        
+        # Dedicated folder for the captured images of detected rice weevils
+        self.scan_images_dir = os.path.join(self.current_scan_folder, "detected_images")
+        os.makedirs(self.scan_images_dir, exist_ok=True)
         
         # Generate scan ID for database
         self.current_scan_id = f"scan_{timestamp}"
@@ -577,19 +852,29 @@ class MainWindow(QMainWindow):
         self.scan_max_count = 0
         self.scan_avg_temp = 0.0
         self.scan_temp_readings = []
+        self.scan_detection_count = 0
+        self.scan_image_count = 0
+        self.latest_annotated_left = None
+        self.latest_annotated_right = None
+        self.left_video_path = left_video_path
+        self.right_video_path = right_video_path
         
         # Create scan record in database
         start_time_str = self.scan_start_time.strftime("%Y-%m-%d %H:%M:%S")
         self.db.create_scan(self.current_scan_id, start_time_str, left_video_path, right_video_path)
         
-        self.detection_thread = DetectionThread(self.camera_manager, self.detector)
+        self.detection_thread = DetectionThread(self.camera_manager, self.detector,
+                                                interval_ms=self.detection_interval_ms)
         self.detection_thread.frame_ready_left.connect(self.update_left_frame)
         self.detection_thread.frame_ready_right.connect(self.update_right_frame)
         self.detection_thread.detection_update.connect(self.update_detection)
+        self.detection_thread.stats_update.connect(self.update_performance_stats)
         self.detection_thread.start()
         
-        # Reset image capture tracking
+        # Reset image/log tracking so the previous scan's timings do not leak in
         self.last_image_capture_time = None
+        self.last_log_time = None
+        self.last_significant_log_time = None
         
         self.is_scanning = True
         self.start_button.setText("Stop Scan")
@@ -605,11 +890,37 @@ class MainWindow(QMainWindow):
                 background-color: #d32f2f;
             }
         """)
-        self.status_label.setText("Scanning...")
+        # Start the fixed-duration scan protocol
+        self.scan_timer.start(self.scan_duration_seconds * 1000)
+        self.scan_countdown_timer.start(1000)
+        self.update_scan_countdown()
+        
         self.log_message(f"Scan started - Recording to {self.current_scan_folder}")
-        self.email_notifier.send_activity_log("Scan Started", "Live detection has been initiated")
+        self.log_message(f"Scan will run for {self.scan_duration_seconds} seconds, "
+                         f"then the report will be emailed to {self.email_notifier.recipient_email or 'nobody (email disabled)'}")
+        self.send_email_async("Scan Started", self.email_notifier.send_activity_log,
+                              "Scan Started",
+                              f"Live detection has been initiated. Scan ID: {self.current_scan_id}. "
+                              f"Duration: {self.scan_duration_seconds} seconds.")
+
+    def on_scan_duration_elapsed(self):
+        """Called when the scan protocol duration is reached - auto-stop and email the report."""
+        if not self.is_scanning:
+            return
+        self.log_message(f"Scan protocol duration ({self.scan_duration_seconds}s) reached - stopping scan")
+        self.stop_scan()
+
+    def update_scan_countdown(self):
+        if not self.is_scanning:
+            return
+        remaining_ms = self.scan_timer.remainingTime()
+        remaining = max(0, remaining_ms // 1000) if remaining_ms >= 0 else 0
+        self.status_label.setText(f"Scanning... {remaining // 60:02d}:{remaining % 60:02d} remaining")
 
     def stop_scan(self):
+        self.scan_timer.stop()
+        self.scan_countdown_timer.stop()
+        
         if self.detection_thread:
             self.detection_thread.stop()
             self.detection_thread = None
@@ -624,8 +935,9 @@ class MainWindow(QMainWindow):
             self.video_writer_right.release()
             self.video_writer_right = None
         
-        # Save scan metadata to database and file
-        if self.current_scan_folder and self.current_scan_id:
+        # Persist the scan metadata; the detection log and images are already in the DB
+        scan_id = self.current_scan_id
+        if self.current_scan_folder and scan_id:
             self.save_scan_metadata()
         
         self.is_scanning = False
@@ -644,7 +956,227 @@ class MainWindow(QMainWindow):
         """)
         self.status_label.setText("Ready")
         self.log_message("Scan stopped and saved")
-        self.email_notifier.send_activity_log("Scan Stopped", "Live detection has been stopped")
+        
+        if scan_id:
+            self.email_scan_report(scan_id)
+            self.refresh_scan_history()
+
+    def email_scan_report(self, scan_id: str, interactive: bool = False) -> Optional[str]:
+        """Build the report archive from the database and email it.
+        
+        Everything in the archive - the detection log CSV and the captured rice weevil
+        images - is read back out of SQLite, so this works for any past scan too.
+        """
+        video_paths = [p for p in (getattr(self, 'left_video_path', None),
+                                   getattr(self, 'right_video_path', None)) if p]
+        scan = self.db.get_scan_by_id(scan_id)
+        if scan and not video_paths:
+            video_paths = [p for p in (scan.get('left_video_path'), scan.get('right_video_path')) if p]
+        
+        zip_path = os.path.join(self.reports_dir, f"{scan_id}_report.zip")
+        max_bytes = int(self.email_notifier.max_attachment_mb * 1024 * 1024)
+        
+        try:
+            archive_path, info = report_builder.build_scan_archive(
+                self.db, scan_id, zip_path, video_paths=video_paths, max_bytes=max_bytes)
+        except Exception as e:
+            self.log_message(f"Error building scan archive from database: {e}")
+            return None
+        
+        if not archive_path:
+            self.log_message(f"Could not build archive: {info.get('error')}")
+            return None
+        
+        self.log_message(
+            f"Scan archive built from database: {os.path.basename(archive_path)} "
+            f"({info['archive_bytes'] / (1024 * 1024):.2f} MB, {info['log_entry_count']} log entries, "
+            f"{info['image_count']} images, videos {'included' if info['included_videos'] else 'excluded'})")
+        
+        summary = report_builder.build_scan_summary(self.db, scan_id) or {}
+        report_id = self.db.create_report(
+            scan_id, self.email_notifier.recipient_email, info['archive_name'],
+            info['archive_bytes'], info['image_count'], info['log_entry_count'],
+            info['included_videos'])
+        
+        if not self.email_notifier.enabled:
+            self.db.update_report_status(report_id, 'skipped', 'email disabled or not configured')
+            self.log_message("Email disabled - archive saved locally and recorded in the database")
+            if interactive:
+                QMessageBox.information(self, "Email disabled",
+                                        f"Archive saved to:\n{archive_path}\n\n"
+                                        "Email is disabled or not configured in config.env.")
+            return archive_path
+        
+        self.log_message(f"Emailing scan report to {self.email_notifier.recipient_email}...")
+        self.send_email_async(f"Scan Report {scan_id}", self.email_notifier.send_scan_report,
+                              scan_id, archive_path, summary, report_id=report_id)
+        return archive_path
+
+    def send_email_async(self, description: str, send_func, *args, report_id: Optional[int] = None, **kwargs):
+        if not self.email_notifier.enabled:
+            return
+        thread = EmailThread(description, send_func, *args, **kwargs)
+        thread.finished_with_status.connect(
+            lambda ok, msg, rid=report_id: self.on_email_finished(ok, msg, rid))
+        thread.finished.connect(lambda: self.email_threads.remove(thread) if thread in self.email_threads else None)
+        self.email_threads.append(thread)
+        thread.start()
+
+    def on_email_finished(self, ok: bool, message: str, report_id: Optional[int]):
+        self.log_message(message)
+        if report_id is not None:
+            self.db.update_report_status(report_id, 'sent' if ok else 'failed',
+                                        None if ok else message)
+            self.refresh_scan_history()
+
+    def refresh_scan_history(self):
+        """Reload the Scan History tab from the database."""
+        try:
+            scans = self.db.get_scan_overview()
+        except Exception as e:
+            self.log_message(f"Error reading scan history: {e}")
+            return
+        
+        total_images = sum(s.get('image_count') or 0 for s in scans)
+        total_logs = sum(s.get('detection_count') or 0 for s in scans)
+        self.db_status_label.setText(
+            f"Database: {self.db.db_path}   |   {len(scans)} scans   |   {total_logs} log rows   |   "
+            f"{total_images} stored images   |   file size {self.db.get_database_size() / (1024 * 1024):.2f} MB")
+        
+        self.scan_table.setRowCount(0)
+        for scan in scans:
+            row = self.scan_table.rowCount()
+            self.scan_table.insertRow(row)
+            avg_temp = scan.get('avg_temperature_celsius')
+            values = [
+                scan.get('scan_id', ''),
+                scan.get('start_time', ''),
+                str(scan.get('max_weevil_count', 0)),
+                f"{avg_temp:.1f}°C" if isinstance(avg_temp, (int, float)) else "N/A",
+                str(scan.get('detection_count', 0)),
+                f"{scan.get('image_count', 0)} ({(scan.get('image_total_bytes') or 0) / 1024:.0f} KB)",
+                scan.get('report_status') or '-',
+            ]
+            for col, value in enumerate(values):
+                self.scan_table.setItem(row, col, QTableWidgetItem(value))
+        
+        if self.scan_table.rowCount() and not self.scan_table.selectedItems():
+            self.scan_table.selectRow(0)
+
+    def selected_scan_id(self) -> Optional[str]:
+        row = self.scan_table.currentRow()
+        if row < 0:
+            return None
+        item = self.scan_table.item(row, 0)
+        return item.text() if item else None
+
+    def on_scan_selected(self):
+        """Load the selected scan's stored detection log and images out of the database."""
+        scan_id = self.selected_scan_id()
+        self.image_list.clear()
+        self.history_log_table.setRowCount(0)
+        self.image_preview_label.setPixmap(QPixmap())
+        if not scan_id:
+            return
+        
+        try:
+            detections = self.db.get_detections_by_scan(scan_id)
+            images = self.db.get_scan_images(scan_id, include_blob=False)
+        except Exception as e:
+            self.log_message(f"Error loading scan {scan_id}: {e}")
+            return
+        
+        for detection in detections:
+            row = self.history_log_table.rowCount()
+            self.history_log_table.insertRow(row)
+            temp = detection.get('temperature_celsius')
+            values = [
+                detection.get('timestamp', ''),
+                str(detection.get('weevil_count', 0)),
+                f"{temp:.1f}°C" if isinstance(temp, (int, float)) else "N/A",
+                detection.get('recommendation', ''),
+            ]
+            for col, value in enumerate(values):
+                self.history_log_table.setItem(row, col, QTableWidgetItem(value))
+        
+        for image in images:
+            item = QListWidgetItem(f"[{image['camera']}] {image['filename']} "
+                                   f"({(image.get('image_bytes') or 0) / 1024:.0f} KB)")
+            item.setData(Qt.UserRole, image['id'])
+            self.image_list.addItem(item)
+        
+        self.image_preview_label.setText(
+            f"{len(images)} image(s) stored for {scan_id}" if images
+            else f"No images stored for {scan_id}")
+        if images:
+            self.image_list.setCurrentRow(0)
+
+    def on_history_image_selected(self, row: int):
+        """Render a stored image straight from its database BLOB."""
+        if row < 0:
+            return
+        item = self.image_list.item(row)
+        if item is None:
+            return
+        image_id = item.data(Qt.UserRole)
+        scan_id = self.selected_scan_id()
+        if not scan_id or image_id is None:
+            return
+        
+        blob = next((i.get('image_blob') for i in self.db.get_scan_images(scan_id)
+                     if i['id'] == image_id), None)
+        if not blob:
+            self.image_preview_label.setText("Image data missing from database")
+            return
+        
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(bytes(blob), 'JPG'):
+            self.image_preview_label.setText("Could not decode stored image")
+            return
+        self.image_preview_label.setPixmap(
+            pixmap.scaled(self.image_preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def resend_selected_report(self):
+        """Rebuild the selected scan's archive from the database and email it again."""
+        scan_id = self.selected_scan_id()
+        if not scan_id:
+            QMessageBox.information(self, "No scan selected", "Select a scan in the table first.")
+            return
+        self.log_message(f"Rebuilding and emailing report for {scan_id} from the database...")
+        self.email_scan_report(scan_id, interactive=True)
+        self.refresh_scan_history()
+
+    def export_selected_report(self):
+        """Save the database-built archive for the selected scan to a chosen location."""
+        scan_id = self.selected_scan_id()
+        if not scan_id:
+            QMessageBox.information(self, "No scan selected", "Select a scan in the table first.")
+            return
+        
+        target, _ = QFileDialog.getSaveFileName(self, "Export scan report",
+                                                os.path.join(self.reports_dir, f"{scan_id}_report.zip"),
+                                                "Zip archives (*.zip)")
+        if not target:
+            return
+        
+        scan = self.db.get_scan_by_id(scan_id) or {}
+        video_paths = [p for p in (scan.get('left_video_path'), scan.get('right_video_path')) if p]
+        try:
+            archive_path, info = report_builder.build_scan_archive(
+                self.db, scan_id, target, video_paths=video_paths)
+        except Exception as e:
+            QMessageBox.warning(self, "Export failed", str(e))
+            return
+        
+        if not archive_path:
+            QMessageBox.warning(self, "Export failed", str(info.get('error')))
+            return
+        
+        self.log_message(f"Exported {info['archive_name']} "
+                         f"({info['archive_bytes'] / (1024 * 1024):.2f} MB) from the database")
+        QMessageBox.information(self, "Export complete",
+                                f"{info['log_entry_count']} log entries and {info['image_count']} images "
+                                f"written to:\n{archive_path}")
 
     def view_previous_scans(self):
         # Open the previous scans folder in the system file explorer
@@ -663,55 +1195,82 @@ class MainWindow(QMainWindow):
         else:
             self.log_message("Previous scans folder does not exist yet")
     
-    def save_scan_metadata(self):
-        """Save scan metadata to database and JSON file"""
+    def save_scan_metadata(self) -> Optional[dict]:
+        """Save scan metadata to database and JSON file, returning the summary."""
         import json
-        from datetime import datetime
         
         if not self.current_scan_folder or not self.current_scan_id:
-            return
+            return None
         
         # Calculate average temperature
         avg_temp = sum(self.scan_temp_readings) / len(self.scan_temp_readings) if self.scan_temp_readings else 0.0
         
-        # Save to database
         end_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.db.update_scan(
-            self.current_scan_id,
-            end_time_str,
-            self.scan_max_count,
-            round(avg_temp, 2) if avg_temp is not None else None,
-            len(self.scan_temp_readings)
-        )
-        
-        # Save to JSON file
+        image_count = self.db.get_scan_image_count(self.current_scan_id)
+        duration = int((datetime.now() - self.scan_start_time).total_seconds()) if self.scan_start_time else None
+        model_info = self.detector.get_model_info()
         metadata = {
+            "scan_id": self.current_scan_id,
             "scan_start_time": self.scan_start_time.strftime("%Y-%m-%d %H:%M:%S") if self.scan_start_time else None,
             "scan_end_time": end_time_str,
+            "duration_seconds": duration,
+            "protocol_duration_seconds": self.scan_duration_seconds,
             "max_weevil_count": self.scan_max_count,
             "average_temperature_celsius": round(avg_temp, 2) if avg_temp is not None else None,
             "temperature_readings_count": len(self.scan_temp_readings),
+            "log_entry_count": self.scan_detection_count,
+            "image_count": image_count,
+            "recommendation": self.logger.generate_recommendation(self.scan_max_count, self.is_after_mixing),
+            "after_mixing": self.is_after_mixing,
+            "model": {
+                "name": model_info['model_name'],
+                "architecture": model_info['architecture'],
+                "backend": model_info['backend'],
+                "imgsz": model_info['imgsz'],
+                "confidence_threshold": model_info['confidence_threshold'],
+                "classes": model_info['classes'],
+            },
+            "avg_inference_ms": round(self.detector.avg_inference_ms, 1),
+            "temperature_sensor": self.temp_sensor.get_status(),
+            "led_controller": self.led_controller.get_status(),
             "videos": {
                 "left_camera": "left_camera.mp4",
                 "right_camera": "right_camera.mp4"
             }
         }
         
+        # Save to database (metadata_json makes the scan row self-describing)
+        self.db.update_scan(
+            self.current_scan_id,
+            end_time_str,
+            self.scan_max_count,
+            round(avg_temp, 2) if avg_temp is not None else None,
+            len(self.scan_temp_readings),
+            json.dumps(metadata)
+        )
+        
+        # Also drop a copy next to the recordings for offline inspection
         metadata_path = os.path.join(self.current_scan_folder, "scan_metadata.json")
         with open(metadata_path, 'w') as f:
             json.dump(metadata, f, indent=4)
         
-        self.log_message(f"Scan metadata saved to database and {metadata_path}")
+        self.log_message(f"Scan metadata saved to database ({self.scan_detection_count} log entries, "
+                         f"{image_count} images stored)")
+        return metadata
 
     def set_red_light(self):
-        self.led_controller.set_red()
-        self.log_message("Red light activated")
-        self.email_notifier.send_activity_log("LED Control", "Red light activated to lure rice weevils")
+        applied = self.led_controller.set_red()
+        suffix = "" if applied else " (simulated - no LED hardware)"
+        self.log_message(f"Red light activated{suffix}")
+        self.send_email_async("LED Control", self.email_notifier.send_activity_log,
+                              "LED Control", "Red light activated to lure rice weevils")
 
     def set_white_light(self):
-        self.led_controller.set_white()
-        self.log_message("White light activated")
-        self.email_notifier.send_activity_log("LED Control", "White light activated for detection")
+        applied = self.led_controller.set_white()
+        suffix = "" if applied else " (simulated - no LED hardware)"
+        self.log_message(f"White light activated{suffix}")
+        self.send_email_async("LED Control", self.email_notifier.send_activity_log,
+                              "LED Control", "White light activated for detection")
 
     def toggle_mixing_state(self):
         self.is_after_mixing = not self.is_after_mixing
@@ -744,13 +1303,16 @@ class MainWindow(QMainWindow):
             self.log_message("Marked as before mixing/sifting")
 
     def set_leds_off(self):
-        self.led_controller.off()
-        self.log_message("LEDs turned off")
-        self.email_notifier.send_activity_log("LED Control", "LEDs turned off")
+        applied = self.led_controller.off()
+        suffix = "" if applied else " (simulated - no LED hardware)"
+        self.log_message(f"LEDs turned off{suffix}")
+        self.send_email_async("LED Control", self.email_notifier.send_activity_log,
+                              "LED Control", "LEDs turned off")
 
     def update_left_frame(self, frame: np.ndarray, detection: DetectionResult):
         # Draw detections on frame
         annotated_frame = self.detector.draw_detections(frame, detection)
+        self.latest_annotated_left = annotated_frame
         
         # Write to video file if recording
         if self.video_writer_left and self.video_writer_left.isOpened():
@@ -770,6 +1332,7 @@ class MainWindow(QMainWindow):
     def update_right_frame(self, frame: np.ndarray, detection: DetectionResult):
         # Draw detections on frame
         annotated_frame = self.detector.draw_detections(frame, detection)
+        self.latest_annotated_right = annotated_frame
         
         # Write to video file if recording
         if self.video_writer_right and self.video_writer_right.isOpened():
@@ -786,11 +1349,11 @@ class MainWindow(QMainWindow):
         scaled_pixmap = pixmap.scaled(self.right_camera_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.right_camera_label.setPixmap(scaled_pixmap)
 
-    def update_detection(self, count: int, confidence: float, activity: str, left_frame: np.ndarray = None, right_frame: np.ndarray = None):
-        from datetime import datetime, timedelta
-        
+    def update_detection(self, count: int, confidence: float, activity: str):
         # Update count label (always update real-time)
         self.count_label.setText(f"Weevil Count: {count}")
+        self.confidence_label.setText(
+            f"Avg Confidence: {confidence * 100:.1f}%" if confidence else "Avg Confidence: --")
         
         # Get temperature
         temperature = self.temp_sensor.read_temperature()
@@ -801,30 +1364,39 @@ class MainWindow(QMainWindow):
                 self.scan_max_count = count
             if temperature is not None:
                 self.scan_temp_readings.append(temperature)
-            
-            # Capture image if weevil count is high and cooldown has passed
-            if count >= self.high_weevil_threshold:
-                current_time = datetime.now()
-                if self.last_image_capture_time is None or \
-                   (current_time - self.last_image_capture_time).total_seconds() >= self.image_capture_cooldown:
-                    self.capture_high_weevil_image(left_frame, right_frame, count, temperature)
-                    self.last_image_capture_time = current_time
         
-        # Check if 1 minute has passed since last log
         current_time = datetime.now()
-        should_log = False
+        # "Significant" means a noticeably high reading, not merely a non-zero one.
+        is_significant = count >= self.high_weevil_threshold
         
-        if self.last_log_time is None:
-            should_log = True
-        elif current_time - self.last_log_time >= timedelta(minutes=1):
-            should_log = True
+        # Images are only captured for significant counts, rate-limited by the cooldown.
+        should_capture = (self.is_scanning and is_significant and
+                         (self.last_image_capture_time is None or
+                          (current_time - self.last_image_capture_time).total_seconds() >= self.image_capture_cooldown))
         
-        # Always log to file (for data integrity), but only update UI log display and table every 1 minute
+        # Log every significant reading (rate-limited so a sustained high count does not
+        # flood the table), plus a sparse baseline row so quiet scans still record that
+        # the equipment was running and found little or nothing.
+        should_log_significant = is_significant and (
+            self.last_significant_log_time is None or
+            (current_time - self.last_significant_log_time).total_seconds() >= self.significant_log_interval_seconds)
+        should_log_baseline = (self.last_log_time is None or
+                               current_time - self.last_log_time >= timedelta(seconds=self.log_interval_seconds))
+        should_log = should_log_significant or should_log_baseline
+        
+        # Always log to the CSV file (for data integrity)
         log_entry = self.logger.log_detection(count, temperature, self.is_after_mixing, activity)
         
-        # Save to database if scanning
-        if self.is_scanning and self.current_scan_id and should_log:
-            self.db.add_detection(
+        # Update recommendation (always update real-time)
+        self.recommendation_label.setText(f"Recommendation: {log_entry.recommendation}")
+        
+        if not (should_log or should_capture):
+            return
+        
+        # Persist the detection row, then attach any captured images to it
+        detection_id = None
+        if self.is_scanning and self.current_scan_id:
+            detection_id = self.db.add_detection(
                 self.current_scan_id,
                 log_entry.timestamp,
                 count,
@@ -832,39 +1404,78 @@ class MainWindow(QMainWindow):
                 log_entry.recommendation,
                 activity
             )
+            self.scan_detection_count += 1
         
-        # Update recommendation (always update real-time)
-        self.recommendation_label.setText(f"Recommendation: {log_entry.recommendation}")
+        if should_capture:
+            self.capture_detection_images(count, confidence, detection_id)
+            self.last_image_capture_time = current_time
         
-        # Only update log display and table every 1 minute
         if should_log:
             temp_str = f"{temperature:.1f}°C" if temperature is not None else "N/A"
-            self.log_message(f"{log_entry.timestamp} - Count: {count}, Temp: {temp_str}, Rec: {log_entry.recommendation}")
-            
-            # Add to detection table
+            marker = "HIGH COUNT " if should_log_significant else ""
+            self.log_message(f"{marker}{log_entry.timestamp} - Count: {count}, Temp: {temp_str}, "
+                             f"Rec: {log_entry.recommendation}")
             self.add_detection_to_table(log_entry.timestamp, count, temperature, log_entry.recommendation)
-            
-            # Update last log time
             self.last_log_time = current_time
+            if should_log_significant:
+                self.last_significant_log_time = current_time
     
-    def capture_high_weevil_image(self, left_frame: np.ndarray, right_frame: np.ndarray, count: int, temperature: float):
-        """Capture and save images when weevil count is high"""
-        if not self.current_scan_folder:
-            return
+    def capture_detection_images(self, count: int, confidence: float = 0.0,
+                                detection_id: Optional[int] = None) -> list:
+        """Store annotated snapshots of the detected rice weevils in the database (and on disk).
         
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        The JPEG bytes go into scan_images so the emailing system can rebuild the report
+        archive from the database alone.
+        """
+        if not self.current_scan_id:
+            return []
         
-        # Save left camera image
-        if left_frame is not None:
-            left_image_path = os.path.join(self.current_scan_folder, f"high_weevil_left_{timestamp}.jpg")
-            cv2.imwrite(left_image_path, left_frame)
-            self.log_message(f"High weevil count ({count}) - Saved left image: {left_image_path}")
+        timestamp = datetime.now()
+        stamp = timestamp.strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        # Images are only captured for significant counts, so they are all high-count frames.
+        prefix = "high_weevil"
+        quality = int(os.getenv('IMAGE_JPEG_QUALITY', '85'))
+        saved = []
         
-        # Save right camera image
-        if right_frame is not None:
-            right_image_path = os.path.join(self.current_scan_folder, f"high_weevil_right_{timestamp}.jpg")
-            cv2.imwrite(right_image_path, right_frame)
-            self.log_message(f"High weevil count ({count}) - Saved right image: {right_image_path}")
+        for side, frame in (("left", self.latest_annotated_left), ("right", self.latest_annotated_right)):
+            if frame is None:
+                continue
+            filename = f"{prefix}_{side}_{stamp}_count{count}.jpg"
+            ok, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+            if not ok:
+                continue
+            
+            # Keep a copy on disk next to the recordings for offline browsing
+            path = os.path.join(self.scan_images_dir, filename) if self.scan_images_dir else None
+            if path:
+                try:
+                    with open(path, 'wb') as f:
+                        f.write(buffer.tobytes())
+                except OSError as e:
+                    self.log_message(f"Could not write image to disk ({e}); database copy still stored")
+                    path = None
+            
+            try:
+                self.db.add_scan_image(
+                    scan_id=self.current_scan_id,
+                    timestamp=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                    camera=side,
+                    filename=filename,
+                    image_blob=buffer.tobytes(),
+                    weevil_count=count,
+                    confidence_avg=round(confidence, 4) if confidence else None,
+                    file_path=path,
+                    detection_id=detection_id,
+                )
+                saved.append(filename)
+                self.scan_image_count += 1
+            except Exception as e:
+                self.log_message(f"Error storing image in database: {e}")
+        
+        if saved:
+            self.log_message(f"High weevil count ({count} >= {self.high_weevil_threshold}) - "
+                             f"stored {len(saved)} image(s) in database")
+        return saved
 
     def add_detection_to_table(self, timestamp: str, count: int, temperature: Optional[float], recommendation: str):
         temp_str = f"{temperature:.1f}°C" if temperature is not None else "N/A"
@@ -885,12 +1496,31 @@ class MainWindow(QMainWindow):
             self.detection_table.removeRow(0)
 
     def update_temperature(self):
+        """Refresh the temperature readout. Non-blocking: the DS18B20 is polled in
+        its own thread, so this only reads the cached value."""
         temperature = self.temp_sensor.read_temperature()
+        status = self.temp_sensor.get_status()
+        
         if temperature is not None:
             self.temp_label.setText(f"Temperature: {temperature:.1f}°C")
+            self.temp_label.setStyleSheet(
+                "padding: 8px; background-color: #e3f2fd; border-radius: 5px; border: 1px solid #bbdefb;")
+        elif not status['available']:
+            self.temp_label.setText("Temperature: sensor not detected")
+            self.temp_label.setStyleSheet(
+                "padding: 8px; background-color: #ffebee; border-radius: 5px; border: 1px solid #ef9a9a; color: #b71c1c;")
+        else:
+            self.temp_label.setText("Temperature: no recent reading")
+            self.temp_label.setStyleSheet(
+                "padding: 8px; background-color: #fff8e1; border-radius: 5px; border: 1px solid #ffecb3; color: #8d6e00;")
+        
+        # Surface a sensor fault once rather than on every tick
+        error = status.get('last_error')
+        if error and error != getattr(self, '_last_temp_error', None):
+            self.log_message(f"Temperature sensor: {error}")
+        self._last_temp_error = error
     
     def update_clock(self):
-        from datetime import datetime
         now = datetime.now()
         # Format: June 25, 2026 9:31:45 PM
         date_str = now.strftime("%B %d, %Y")
@@ -899,6 +1529,8 @@ class MainWindow(QMainWindow):
         # Update date and time labels on Live Feed tab
         self.date_label.setText(f"Date: {date_str}")
         self.time_label.setText(f"Time: {time_str}")
+        # And the header clock, which stays visible on every tab
+        self.header_clock_label.setText(f"{date_str}   {time_str}")
 
     def log_message(self, message: str):
         self.log_text.append(message)
@@ -909,7 +1541,11 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if self.is_scanning:
             self.stop_scan()
+        # Let any in-flight report email finish so the scan report is not lost on exit
+        for thread in list(self.email_threads):
+            thread.wait(90000)
         self.led_controller.cleanup()
+        self.temp_sensor.cleanup()
         event.accept()
 
 

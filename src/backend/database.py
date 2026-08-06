@@ -107,6 +107,84 @@ class DatabaseManager:
             )
             return cursor.lastrowid
     
+    def add_scan_image(self, scan_id: str, timestamp: str, camera: str, filename: str,
+                       image_blob: bytes, weevil_count: int = 0,
+                       confidence_avg: Optional[float] = None,
+                       file_path: Optional[str] = None,
+                       detection_id: Optional[int] = None) -> int:
+        """Store a captured image of detected rice weevils as a BLOB in the database."""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO scan_images (scan_id, detection_id, timestamp, camera, weevil_count,
+                                         confidence_avg, filename, file_path, image_bytes, image_blob)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (scan_id, detection_id, timestamp, camera, weevil_count, confidence_avg,
+                 filename, file_path, len(image_blob), sqlite3.Binary(image_blob))
+            )
+            return cursor.lastrowid
+
+    def get_scan_images(self, scan_id: str, include_blob: bool = True) -> List[Dict[str, Any]]:
+        """Get the captured images for a scan. Set include_blob=False to list metadata only."""
+        columns = ("id, scan_id, detection_id, timestamp, camera, weevil_count, confidence_avg, "
+                   "filename, file_path, image_bytes")
+        if include_blob:
+            columns += ", image_blob"
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                f"SELECT {columns} FROM scan_images WHERE scan_id=? ORDER BY timestamp ASC, camera ASC",
+                (scan_id,)
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_scan_image_count(self, scan_id: str) -> int:
+        with self._get_connection() as conn:
+            cursor = conn.execute("SELECT COUNT(*) AS n FROM scan_images WHERE scan_id=?", (scan_id,))
+            return cursor.fetchone()['n']
+
+    def create_report(self, scan_id: str, recipients: str, archive_name: str,
+                      archive_bytes: int, image_count: int, log_entry_count: int,
+                      included_videos: bool) -> int:
+        """Record a scan report awaiting delivery."""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO scan_reports (scan_id, created_at, recipients, archive_name, archive_bytes,
+                                          image_count, log_entry_count, included_videos, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                """,
+                (scan_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), recipients, archive_name,
+                 archive_bytes, image_count, log_entry_count, 1 if included_videos else 0)
+            )
+            return cursor.lastrowid
+
+    def update_report_status(self, report_id: int, status: str, error: Optional[str] = None):
+        """Mark a report as sent or failed."""
+        with self._get_connection() as conn:
+            conn.execute(
+                "UPDATE scan_reports SET status=?, error=?, sent_at=? WHERE id=?",
+                (status, error, datetime.now().strftime("%Y-%m-%d %H:%M:%S") if status == 'sent' else None,
+                 report_id)
+            )
+
+    def get_reports(self, scan_id: Optional[str] = None, status: Optional[str] = None,
+                    limit: int = 100) -> List[Dict[str, Any]]:
+        clauses, params = [], []
+        if scan_id:
+            clauses.append("scan_id=?")
+            params.append(scan_id)
+        if status:
+            clauses.append("status=?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                f"SELECT * FROM scan_reports {where} ORDER BY created_at DESC LIMIT ?", params
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
     def get_scan_by_id(self, scan_id: str) -> Optional[Dict[str, Any]]:
         """Get scan metadata by scan ID"""
         with self._get_connection() as conn:
@@ -130,6 +208,25 @@ class DatabaseManager:
             )
             return [dict(row) for row in cursor.fetchall()]
     
+    def get_scan_overview(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """Scans joined with their detection/image/report counts, for the Scan History UI."""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT s.*,
+                       (SELECT COUNT(*) FROM detections d WHERE d.scan_id = s.scan_id) AS detection_count,
+                       (SELECT COUNT(*) FROM scan_images i WHERE i.scan_id = s.scan_id) AS image_count,
+                       (SELECT COALESCE(SUM(i.image_bytes), 0) FROM scan_images i WHERE i.scan_id = s.scan_id) AS image_total_bytes,
+                       (SELECT r.status FROM scan_reports r WHERE r.scan_id = s.scan_id
+                         ORDER BY r.created_at DESC LIMIT 1) AS report_status
+                FROM scans s
+                ORDER BY s.start_time DESC
+                LIMIT ?
+                """,
+                (limit,)
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
     def get_detections_by_scan(self, scan_id: str) -> List[Dict[str, Any]]:
         """Get all detections for a specific scan"""
         with self._get_connection() as conn:
@@ -187,18 +284,24 @@ class DatabaseManager:
             return dict(row) if row else {}
     
     def delete_scan(self, scan_id: str) -> bool:
-        """Delete a scan and its detections"""
+        """Delete a scan and its detections, images and reports"""
         with self._get_connection() as conn:
-            # Delete detections first (foreign key)
+            # Delete children first (foreign keys)
+            conn.execute("DELETE FROM scan_images WHERE scan_id=?", (scan_id,))
+            conn.execute("DELETE FROM scan_reports WHERE scan_id=?", (scan_id,))
             conn.execute("DELETE FROM detections WHERE scan_id=?", (scan_id,))
             # Delete scan
             cursor = conn.execute("DELETE FROM scans WHERE scan_id=?", (scan_id,))
             return cursor.rowcount > 0
     
     def cleanup_old_scans(self, days: int = 30) -> int:
-        """Delete scans older than specified days"""
+        """Delete scans older than specified days, including their image BLOBs"""
         with self._get_connection() as conn:
             cutoff_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+            stale = "SELECT scan_id FROM scans WHERE start_time < ?"
+            conn.execute(f"DELETE FROM scan_images WHERE scan_id IN ({stale})", (cutoff_date,))
+            conn.execute(f"DELETE FROM scan_reports WHERE scan_id IN ({stale})", (cutoff_date,))
+            conn.execute(f"DELETE FROM detections WHERE scan_id IN ({stale})", (cutoff_date,))
             cursor = conn.execute(
                 "DELETE FROM scans WHERE start_time < ?", (cutoff_date,)
             )

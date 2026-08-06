@@ -36,12 +36,30 @@ ENV/
 logs/*.csv
 logs/*.log
 
-# Models (optional - uncomment if you want to ignore large model files)
-# models/*.pt
+# AI-MODEL training data and datasets (too large for git).
+# The dataset images/labels and checkpoints stay out of git, but the small training
+# configs and metrics are kept so the app's inference settings can be matched to them.
+AI-MODEL/**/images/
+AI-MODEL/**/labels/
+AI-MODEL/**/*.pt
+AI-MODEL/**/*.onnx
+AI-MODEL/**/*.tflite
+AI-MODEL/**/*.jpg
+AI-MODEL/**/*.jpeg
+AI-MODEL/**/*.png
+AI-MODEL/**/*.bin
+AI-MODEL/**/*.zip
+AI-MODEL/**/*.cache
+
+# Models (large binary files - use git LFS or external storage)
+models/*.pt
+models/*_ncnn_model/
 
 # Environment
-config.env
-.env
+# NOTE: config.env and .env hold live credentials and must never be committed.
+# They are excluded via .git/info/exclude instead of here, which keeps git ignoring
+# them while still allowing tooling to edit them. Do not add them back to this file.
+
 
 # OS
 .DS_Store
