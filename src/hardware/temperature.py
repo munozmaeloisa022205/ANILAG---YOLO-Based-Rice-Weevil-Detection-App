@@ -60,6 +60,9 @@ class TemperatureSensor:
         self._temperature: Optional[float] = None
         self._last_good_time: Optional[float] = None
         self._recent = []           # small window for median smoothing
+        # Increments once per accepted conversion. Callers polling faster than
+        # poll_interval use this to tell a fresh reading from a repeated cached one.
+        self._sample_id = 0
         self._read_count = 0
         self._error_count = 0
         self.last_error: Optional[str] = None
@@ -141,7 +144,14 @@ class TemperatureSensor:
                     self._stop.wait(max(self.poll_interval, 2.0))
                     continue
 
-            value = self._read_sensor_blocking()
+            try:
+                value = self._read_sensor_blocking()
+            except Exception as e:
+                # The poll thread must never die - that would silently freeze the
+                # temperature readout for the rest of the session.
+                self.last_error = f"Unexpected sensor error: {e}"
+                self._error_count += 1
+                value = None
             if value is not None:
                 self._store(value)
             self._stop.wait(self.poll_interval)
@@ -150,6 +160,8 @@ class TemperatureSensor:
 
     def _read_sensor_blocking(self, attempts: int = 3) -> Optional[float]:
         """Read and validate one temperature in Celsius. Blocks up to ~750ms per attempt."""
+        if not self.sensor_path:
+            return None
         for attempt in range(attempts):
             try:
                 with open(self.sensor_path, 'r') as f:
@@ -209,6 +221,7 @@ class TemperatureSensor:
                 self._recent.pop(0)
             self._temperature = celsius
             self._last_good_time = time.monotonic()
+            self._sample_id += 1
 
     # ----------------------------------------------------------------- public
 
@@ -222,6 +235,17 @@ class TemperatureSensor:
             if time.monotonic() - self._last_good_time >= self.stale_after:
                 return None
             return self._temperature
+
+    def read_sample(self) -> tuple:
+        """(sample_id, celsius) for the latest reading. The id only changes when a new
+        conversion has actually completed, so callers polling faster than the sensor
+        can avoid recording the same measurement many times over."""
+        with self._lock:
+            if self._temperature is None or self._last_good_time is None:
+                return (self._sample_id, None)
+            if time.monotonic() - self._last_good_time >= self.stale_after:
+                return (self._sample_id, None)
+            return (self._sample_id, self._temperature)
 
     def read_temperature_smoothed(self) -> Optional[float]:
         """Median of the recent readings - rejects single-sample spikes."""
@@ -246,6 +270,7 @@ class TemperatureSensor:
                 'temperature_celsius': self._temperature,
                 'reading_age_seconds': round(age, 1) if age is not None else None,
                 'stale': age is not None and age > self.stale_after,
+                'samples': self._sample_id,
                 'reads': self._read_count,
                 'errors': self._error_count,
                 'poll_interval': self.poll_interval,

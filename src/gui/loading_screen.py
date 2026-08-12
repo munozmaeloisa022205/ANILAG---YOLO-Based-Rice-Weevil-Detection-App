@@ -4,7 +4,7 @@ Displays logo during 5-second startup with smooth animations
 """
 
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QLabel, QProgressBar, QGraphicsDropShadowEffect
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QPoint
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QPixmap, QFont, QColor
 import os
 import sys

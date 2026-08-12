@@ -1,12 +1,22 @@
-"""Temporary test: WS2813 SPI encoding, DS18B20 parsing/robustness, clock, UI wiring."""
+"""Hardware verification for Anilag: WS2813 SPI encoding, DS18B20 parsing/robustness,
+real-time clock and the temperature display/recording path.
+
+Runs without any hardware attached (SPI and 1-Wire are faked), so it is safe on a
+development machine as well as on the Raspberry Pi 5.
+
+    python tools/test_hardware.py
+"""
 import os, sys, types, tempfile, shutil, time
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ['QT_QPA_PLATFORM'] = 'offscreen'
 os.environ['EMAIL_ENABLED'] = 'false'
 
 FAIL = []
 def check(name, cond, extra=''):
-    print(('  PASS  ' if cond else '  FAIL  ') + name + (f'   {extra}' if extra else ''), flush=True)
+    # Keep stdout pure ASCII: writing non-ASCII (e.g. the degree sign) to a redirected
+    # stream on Windows/cp1252 can terminate the process mid-run.
+    line = ('  PASS  ' if cond else '  FAIL  ') + name + (f'   {extra}' if extra else '')
+    print(line.encode('ascii', 'backslashreplace').decode('ascii'), flush=True)
     if not cond: FAIL.append(name)
 
 def trace(msg):
@@ -180,7 +190,7 @@ s._store(27.5)
 trace('calling update_temperature')
 w.update_temperature()
 trace('update_temperature returned')
-check('temp displayed in Celsius', '27.5°C' in w.temp_label.text(), w.temp_label.text())
+check('temp displayed in Celsius', '27.5\u00b0C' in w.temp_label.text(), w.temp_label.text())
 w.temp_sensor = missing
 w.update_temperature()
 check('missing sensor shown in UI', 'not detected' in w.temp_label.text(), w.temp_label.text())
@@ -192,12 +202,36 @@ db.create_scan('scan_temp', '2026-08-06 17:00:00', '', '')
 w.scan_images_dir = os.path.join(tmp, 'imgs'); os.makedirs(w.scan_images_dir, exist_ok=True)
 w.is_scanning = True
 w.last_log_time = None
+w.current_scan_folder = os.path.join(tmp, 'scanfolder')
+os.makedirs(w.current_scan_folder, exist_ok=True)
 w.update_detection(2, 0.8, 'Detection')
 rows = db.get_detections_by_scan('scan_temp')
 check('temperature recorded to DB', rows and abs(rows[0]['temperature_celsius'] - 27.5) < 1e-6,
       str(rows[0]['temperature_celsius']) if rows else 'no rows')
 check('temperature collected for scan average', 27.5 in w.scan_temp_readings)
-check('hardware status in metadata',
+
+# The sensor converts every ~2s but detection cycles run every 200ms; the same
+# physical reading must not be counted repeatedly into the scan average.
+before = len(w.scan_temp_readings)
+for _ in range(20):
+    w.update_detection(2, 0.8, 'Detection')
+check('cached reading counted once, not per cycle', len(w.scan_temp_readings) == before,
+      f'{before} -> {len(w.scan_temp_readings)} after 20 cycles')
+s._store(29.0)
+w.update_detection(2, 0.8, 'Detection')
+check('a genuinely new conversion is counted', len(w.scan_temp_readings) == before + 1 and
+      29.0 in w.scan_temp_readings, str(w.scan_temp_readings[-3:]))
+check('sensor exposes sample count', s.get_status()['samples'] > 0)
+
+meta = w.save_scan_metadata() or {}
+check('hardware status in metadata', 'temperature_sensor' in meta)
+check('led status in metadata', 'led_controller' in meta)
+check('metadata json written to scan folder',
+      os.path.exists(os.path.join(w.current_scan_folder, 'scan_metadata.json')))
+
+# Losing the scan folder must not cost us the database record
+w.current_scan_folder = os.path.join(tmp, 'gone', 'missing')
+check('metadata still saved when scan folder is unavailable',
       'temperature_sensor' in (w.save_scan_metadata() or {}))
 w.is_scanning = False
 

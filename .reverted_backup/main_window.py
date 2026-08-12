@@ -1,18 +1,11 @@
 import sys
 import cv2
 import numpy as np
-
-# IMPORTANT: the detector (and therefore torch) must be imported BEFORE PyQt5.
-# On Windows, loading Qt first makes torch's DLL load fail with
-#   OSError: [WinError 1114] ... Error loading "...\torch\lib\c10.dll"
-# because Qt has already pulled in a conflicting runtime. Importing torch first
-# is harmless everywhere else, including the Raspberry Pi. Do not reorder.
-from src.detection.yolov11_detector import YOLOv11Detector, DetectionResult
-
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QPushButton, QLabel, QTextEdit, QGroupBox,
+                             QPushButton, QLabel, QFrame, QTextEdit, QGridLayout, QGroupBox,
                              QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
-                             QListWidget, QListWidgetItem, QSplitter)
+                             QListWidget, QListWidgetItem, QSplitter, QMessageBox,
+                             QFileDialog, QProgressBar)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread
 from PyQt5.QtGui import QImage, QPixmap, QFont, QIcon
 from typing import Optional
@@ -22,9 +15,10 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 # Import modules
-from src.hardware.camera import DualCameraManager
+from src.hardware.camera import Camera, DualCameraManager
 from src.hardware.temperature import TemperatureSensor
 from src.hardware.led_controller import LEDController
+from src.detection.yolov11_detector import YOLOv11Detector, DetectionResult
 from src.logging.logger import DetectionLogger
 from src.notification.email_notifier import EmailNotifier
 from src.backend.database import get_database
@@ -105,32 +99,11 @@ class EmailThread(QThread):
             self.finished_with_status.emit(False, f"Email failed: {self.description} (see console for details)")
 
 
-class CameraLabel(QLabel):
-    """A QLabel that keeps its zoom control panel pinned to the right edge
-    inside the frame when the label (and its pixmap) is resized."""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.zoom_panel = None
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if self.zoom_panel is not None:
-            pw = self.zoom_panel.width()
-            ph = self.zoom_panel.height()
-            # Pin to the right edge, vertically centered
-            x = self.width() - pw - 6
-            y = (self.height() - ph) // 2
-            self.zoom_panel.move(max(2, x), max(2, y))
-            self.zoom_panel.raise_()
-
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Anilag - Rice Weevil Detection System")
-        # Target display is the Raspberry Pi 5 touchscreen at 1024x600.
-        self.setGeometry(50, 50, 1024, 600)
-        self.setMinimumSize(800, 480)
+        self.setGeometry(100, 100, 1200, 800)
         
         # Set window icon
         icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'assets', 'logo.png')
@@ -206,15 +179,6 @@ class MainWindow(QMainWindow):
         self.image_capture_cooldown = int(os.getenv('IMAGE_CAPTURE_COOLDOWN', '30'))  # seconds between captures
         self.latest_annotated_left = None
         self.latest_annotated_right = None
-
-        # Per-camera digital zoom (applied to the displayed feed only; the recorded
-        # video and stored images keep the full frame). Zoom factor of 1.0 = no zoom,
-        # 2.0 = 2x center crop, etc. Capped to keep the Pi 5 crop/resize cheap.
-        self.left_zoom = 1.0
-        self.right_zoom = 1.0
-        self.zoom_step = 0.5
-        self.zoom_min = 1.0
-        self.zoom_max = 5.0
         
         # Scan protocol: each scan runs for a fixed duration, then auto-stops and emails the report
         self.scan_duration_seconds = int(os.getenv('SCAN_DURATION_SECONDS', '180'))
@@ -226,8 +190,6 @@ class MainWindow(QMainWindow):
         # Minimum gap between log rows triggered by a high weevil count
         self.significant_log_interval_seconds = int(os.getenv('SIGNIFICANT_LOG_INTERVAL_SECONDS', '5'))
         self.last_significant_log_time = None
-        # Tracks which DS18B20 conversion has already been added to the scan average
-        self._last_temp_sample_id = None
         # Detection cycle interval - throttles YOLO inference on the Pi 5 CPU
         self.detection_interval_ms = int(os.getenv('DETECTION_INTERVAL_MS', '200'))
         self.scan_detection_count = 0
@@ -248,11 +210,6 @@ class MainWindow(QMainWindow):
         self.clock_timer = QTimer()
         self.clock_timer.timeout.connect(self.update_clock)
         self.clock_timer.start(1000)  # Update every second
-        
-        # Paint both immediately so the UI never shows a blank clock or "--" temperature
-        # for the first second after startup.
-        self.update_clock()
-        self.update_temperature()
         
         # Scan protocol timer - stops the scan after the configured duration
         self.scan_timer = QTimer()
@@ -275,18 +232,18 @@ class MainWindow(QMainWindow):
         header_layout = QHBoxLayout()
         header_widget.setLayout(header_layout)
         header_widget.setStyleSheet("background-color: #f5f5f5; border-bottom: 2px solid #ddd;")
-        header_widget.setMaximumHeight(52)
+        header_widget.setMaximumHeight(80)
         
         # Logo label
         logo_label = QLabel()
         logo_path = os.path.join(os.path.dirname(__file__), '..', '..', 'assets', 'logo.png')
         if os.path.exists(logo_path):
             pixmap = QPixmap(logo_path)
-            pixmap = pixmap.scaled(34, 34, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            pixmap = pixmap.scaled(60, 60, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             logo_label.setPixmap(pixmap)
         else:
             logo_label.setText("ANILAG")
-            logo_label.setFont(QFont("Arial", 14, QFont.Bold))
+            logo_label.setFont(QFont("Arial", 20, QFont.Bold))
             logo_label.setStyleSheet("color: #2E7D32;")
         header_layout.addWidget(logo_label)
         
@@ -294,32 +251,24 @@ class MainWindow(QMainWindow):
         title_container = QWidget()
         title_layout = QVBoxLayout()
         title_layout.setContentsMargins(0, 0, 0, 0)
-        title_layout.setSpacing(1)
+        title_layout.setSpacing(2)
         title_container.setLayout(title_layout)
         
         # Title label
         title_label = QLabel("Anilag")
-        title_label.setFont(QFont("Arial", 15, QFont.Bold))
+        title_label.setFont(QFont("Arial", 22, QFont.Bold))
         title_label.setStyleSheet("color: #2E7D32;")
         title_layout.addWidget(title_label)
         
         # Tagline label
         tagline_label = QLabel("Rice Weevil Detection System")
-        tagline_label.setFont(QFont("Arial", 8))
+        tagline_label.setFont(QFont("Arial", 11))
         tagline_label.setStyleSheet("color: #666;")
         title_layout.addWidget(tagline_label)
         
         header_layout.addWidget(title_container)
         
         header_layout.addStretch()
-        
-        # Always-visible real-time clock (updated every second from the system clock)
-        self.header_clock_label = QLabel()
-        self.header_clock_label.setFont(QFont("Arial", 10, QFont.Bold))
-        self.header_clock_label.setStyleSheet("color: #2E7D32; padding-right: 6px;")
-        self.header_clock_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        header_layout.addWidget(self.header_clock_label)
-        
         main_layout.addWidget(header_widget)
         
         # Create tab widget
@@ -331,13 +280,15 @@ class MainWindow(QMainWindow):
         self.setup_live_feed_tab()
         self.tab_widget.addTab(self.live_feed_tab, "Live Feed")
         
-        # Detection Logs tab - merges the old real-time Detection Information
-        # table with the database-backed scan history. The per-scan detection log
-        # and captured images are read back from SQLite, so a separate live table
-        # would only duplicate what the Live Feed log panel already shows.
+        # Create Detection Information tab
+        self.detection_info_tab = QWidget()
+        self.setup_detection_info_tab()
+        self.tab_widget.addTab(self.detection_info_tab, "Detection Information")
+        
+        # Create Scan History tab (reads scans, logs and images back from the database)
         self.scan_history_tab = QWidget()
         self.setup_scan_history_tab()
-        self.tab_widget.addTab(self.scan_history_tab, "Detection Logs")
+        self.tab_widget.addTab(self.scan_history_tab, "Scan History")
         
         # Status bar
         self.status_label = QLabel("Ready")
@@ -345,117 +296,72 @@ class MainWindow(QMainWindow):
 
     def setup_live_feed_tab(self):
         layout = QHBoxLayout()
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(6)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
         self.live_feed_tab.setLayout(layout)
         
         # Left panel - Camera feeds (large) and controls below
         left_panel = QVBoxLayout()
-        left_panel.setSpacing(6)
+        left_panel.setSpacing(10)
         layout.addLayout(left_panel, stretch=3)
         
         # Camera feeds container - larger
         camera_container = QHBoxLayout()
-        camera_container.setSpacing(6)
+        camera_container.setSpacing(10)
         left_panel.addLayout(camera_container, stretch=3)
-
-        # Per-camera zoom buttons (digital zoom on the displayed feed only).
-        # The buttons are overlaid inside each camera frame, vertically aligned
-        # (+ on top, zoom label, - on bottom) at the right edge.
-        def make_zoom_button(text, handler):
-            btn = QPushButton(text)
-            btn.setFixedSize(26, 26)
-            btn.setStyleSheet("""
-                QPushButton {
-                    background-color: rgba(69, 90, 100, 220); color: white;
-                    font-size: 14px; font-weight: bold;
-                    border-radius: 4px; padding: 1px;
-                }
-                QPushButton:hover { background-color: rgba(96, 125, 139, 240); }
-                QPushButton:pressed { background-color: rgba(55, 71, 79, 255); }
-            """)
-            btn.clicked.connect(handler)
-            return btn
-
-        def build_zoom_overlay(parent_label, side):
-            """Create a vertical zoom control panel overlaid inside a camera label."""
-            panel = QWidget(parent_label)
-            panel_layout = QVBoxLayout(panel)
-            panel_layout.setContentsMargins(0, 0, 0, 0)
-            panel_layout.setSpacing(2)
-            panel_layout.setAlignment(Qt.AlignCenter)
-            zoom_in = make_zoom_button("+", lambda: self.adjust_zoom(side, 1))
-            zoom_out = make_zoom_button("-", lambda: self.adjust_zoom(side, -1))
-            zoom_label = QLabel("1.0x")
-            zoom_label.setFont(QFont("Arial", 8, QFont.Bold))
-            zoom_label.setAlignment(Qt.AlignCenter)
-            zoom_label.setFixedWidth(26)
-            zoom_label.setStyleSheet("color: white; background-color: rgba(0, 0, 0, 150); border-radius: 3px;")
-            panel_layout.addWidget(zoom_in)
-            panel_layout.addWidget(zoom_label)
-            panel_layout.addWidget(zoom_out)
-            panel.adjustSize()
-            panel.show()
-            return panel, zoom_in, zoom_out, zoom_label
-
-        # --- Left camera + its zoom controls ---
-        self.left_camera_label = CameraLabel()
-        self.left_camera_label.setMinimumSize(200, 150)
+        
+        # Left camera feed label - larger
+        self.left_camera_label = QLabel()
+        self.left_camera_label.setMinimumSize(320, 240)
         self.left_camera_label.setSizePolicy(self.left_camera_label.sizePolicy().horizontalPolicy(), self.left_camera_label.sizePolicy().verticalPolicy())
         self.left_camera_label.setStyleSheet("border: 2px solid #333; background-color: #000; border-radius: 5px;")
         self.left_camera_label.setAlignment(Qt.AlignCenter)
         self.left_camera_label.setText("No Signal")
         camera_container.addWidget(self.left_camera_label, stretch=1)
-
+        
+        # Add label overlay on top of left camera
         left_camera_title = QLabel("Left Camera")
-        left_camera_title.setFont(QFont("Arial", 9, QFont.Bold))
-        left_camera_title.setStyleSheet("color: white; background-color: rgba(0, 0, 0, 150); padding: 3px; border-radius: 3px;")
+        left_camera_title.setFont(QFont("Arial", 12, QFont.Bold))
+        left_camera_title.setStyleSheet("color: white; background-color: rgba(0, 0, 0, 150); padding: 5px; border-radius: 3px;")
         left_camera_title.setAlignment(Qt.AlignCenter)
         left_camera_title.setParent(self.left_camera_label)
-        left_camera_title.move(8, 8)
+        left_camera_title.move(10, 10)
         left_camera_title.show()
-
-        left_panel_widgets = build_zoom_overlay(self.left_camera_label, 'left')
-        self.left_zoom_panel, self.left_zoom_in_button, self.left_zoom_out_button, self.left_zoom_label = left_panel_widgets
-        self.left_camera_label.zoom_panel = self.left_zoom_panel
-
-        # --- Right camera + its zoom controls ---
-        self.right_camera_label = CameraLabel()
-        self.right_camera_label.setMinimumSize(200, 150)
+        
+        # Right camera feed label - larger
+        self.right_camera_label = QLabel()
+        self.right_camera_label.setMinimumSize(320, 240)
         self.right_camera_label.setSizePolicy(self.right_camera_label.sizePolicy().horizontalPolicy(), self.right_camera_label.sizePolicy().verticalPolicy())
         self.right_camera_label.setStyleSheet("border: 2px solid #333; background-color: #000; border-radius: 5px;")
         self.right_camera_label.setAlignment(Qt.AlignCenter)
         self.right_camera_label.setText("No Signal")
         camera_container.addWidget(self.right_camera_label, stretch=1)
-
+        
+        # Add label overlay on top of right camera
         right_camera_title = QLabel("Right Camera")
-        right_camera_title.setFont(QFont("Arial", 9, QFont.Bold))
-        right_camera_title.setStyleSheet("color: white; background-color: rgba(0, 0, 0, 150); padding: 3px; border-radius: 3px;")
+        right_camera_title.setFont(QFont("Arial", 12, QFont.Bold))
+        right_camera_title.setStyleSheet("color: white; background-color: rgba(0, 0, 0, 150); padding: 5px; border-radius: 3px;")
         right_camera_title.setAlignment(Qt.AlignCenter)
         right_camera_title.setParent(self.right_camera_label)
-        right_camera_title.move(8, 8)
+        right_camera_title.move(10, 10)
         right_camera_title.show()
-
-        right_panel_widgets = build_zoom_overlay(self.right_camera_label, 'right')
-        self.right_zoom_panel, self.right_zoom_in_button, self.right_zoom_out_button, self.right_zoom_label = right_panel_widgets
-        self.right_camera_label.zoom_panel = self.right_zoom_panel
         
         # Scan controls below camera feeds
         scan_group = QGroupBox("Scan Controls")
         scan_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 5px; margin-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
         scan_layout = QVBoxLayout()
-        scan_layout.setSpacing(5)
+        scan_layout.setSpacing(8)
         
         self.start_button = QPushButton("Start Scan")
-        self.start_button.setMinimumHeight(34)
+        self.start_button.setMinimumHeight(45)
         self.start_button.setStyleSheet("""
             QPushButton {
                 background-color: #4CAF50;
                 color: white;
-                font-size: 12px;
+                font-size: 14px;
                 font-weight: bold;
                 border-radius: 5px;
-                padding: 5px;
+                padding: 8px;
             }
             QPushButton:hover {
                 background-color: #45a049;
@@ -466,16 +372,33 @@ class MainWindow(QMainWindow):
         """)
         self.start_button.clicked.connect(self.toggle_scan)
         scan_layout.addWidget(self.start_button)
+        
+        self.view_scans_button = QPushButton("View Previous Scans")
+        self.view_scans_button.setMinimumHeight(40)
+        self.view_scans_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                font-size: 13px;
+                border-radius: 5px;
+                padding: 6px;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+            }
+        """)
+        self.view_scans_button.clicked.connect(self.view_previous_scans)
+        scan_layout.addWidget(self.view_scans_button)
 
         self.mixing_button = QPushButton("Mark as After Mixing/Sifting")
-        self.mixing_button.setMinimumHeight(30)
+        self.mixing_button.setMinimumHeight(40)
         self.mixing_button.setStyleSheet("""
             QPushButton {
                 background-color: #FF9800;
                 color: white;
-                font-size: 11px;
+                font-size: 13px;
                 border-radius: 5px;
-                padding: 4px;
+                padding: 6px;
             }
             QPushButton:hover {
                 background-color: #F57C00;
@@ -491,17 +414,17 @@ class MainWindow(QMainWindow):
         led_group = QGroupBox("LED Controls")
         led_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 5px; margin-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
         led_layout = QHBoxLayout()
-        led_layout.setSpacing(6)
+        led_layout.setSpacing(8)
         
         self.red_light_button = QPushButton("Red Light")
-        self.red_light_button.setMinimumHeight(28)
+        self.red_light_button.setMinimumHeight(35)
         self.red_light_button.setStyleSheet("""
             QPushButton {
                 background-color: #f44336;
                 color: white;
-                font-size: 11px;
+                font-size: 13px;
                 border-radius: 5px;
-                padding: 4px;
+                padding: 5px;
             }
             QPushButton:hover {
                 background-color: #d32f2f;
@@ -511,15 +434,15 @@ class MainWindow(QMainWindow):
         led_layout.addWidget(self.red_light_button)
         
         self.white_light_button = QPushButton("White Light")
-        self.white_light_button.setMinimumHeight(28)
+        self.white_light_button.setMinimumHeight(35)
         self.white_light_button.setStyleSheet("""
             QPushButton {
                 background-color: #ffffff;
                 color: black;
-                font-size: 11px;
+                font-size: 13px;
                 border-radius: 5px;
                 border: 2px solid #333;
-                padding: 4px;
+                padding: 5px;
             }
             QPushButton:hover {
                 background-color: #e0e0e0;
@@ -529,14 +452,14 @@ class MainWindow(QMainWindow):
         led_layout.addWidget(self.white_light_button)
         
         self.led_off_button = QPushButton("LEDs Off")
-        self.led_off_button.setMinimumHeight(28)
+        self.led_off_button.setMinimumHeight(35)
         self.led_off_button.setStyleSheet("""
             QPushButton {
                 background-color: #333;
                 color: white;
-                font-size: 11px;
+                font-size: 13px;
                 border-radius: 5px;
-                padding: 4px;
+                padding: 5px;
             }
             QPushButton:hover {
                 background-color: #555;
@@ -550,38 +473,49 @@ class MainWindow(QMainWindow):
         
         # Right panel - Current detection info and detection log
         right_panel = QVBoxLayout()
-        right_panel.setSpacing(6)
+        right_panel.setSpacing(10)
         layout.addLayout(right_panel, stretch=1)
-
+        
         # Current detection info
         current_info_group = QGroupBox("Current Detection")
         current_info_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 5px; margin-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
         current_info_layout = QVBoxLayout()
-        current_info_layout.setSpacing(4)
-        current_info_layout.setContentsMargins(8, 8, 8, 8)
+        current_info_layout.setSpacing(8)
+        current_info_layout.setContentsMargins(10, 10, 10, 10)
         
         self.count_label = QLabel("Weevil Count: 0")
-        self.count_label.setFont(QFont("Arial", 11, QFont.Bold))
-        self.count_label.setStyleSheet("padding: 5px; background-color: #e8f5e9; border-radius: 5px; border: 1px solid #c8e6c9;")
+        self.count_label.setFont(QFont("Arial", 14, QFont.Bold))
+        self.count_label.setStyleSheet("padding: 8px; background-color: #e8f5e9; border-radius: 5px; border: 1px solid #c8e6c9;")
         current_info_layout.addWidget(self.count_label)
         
         self.confidence_label = QLabel("Avg Confidence: --")
-        self.confidence_label.setFont(QFont("Arial", 9))
-        self.confidence_label.setStyleSheet("padding: 5px; background-color: #e8f5e9; border-radius: 5px; border: 1px solid #c8e6c9;")
+        self.confidence_label.setFont(QFont("Arial", 11))
+        self.confidence_label.setStyleSheet("padding: 8px; background-color: #e8f5e9; border-radius: 5px; border: 1px solid #c8e6c9;")
         current_info_layout.addWidget(self.confidence_label)
         
         self.temp_label = QLabel("Temperature: --°C")
-        self.temp_label.setFont(QFont("Arial", 10))
-        self.temp_label.setStyleSheet("padding: 5px; background-color: #e3f2fd; border-radius: 5px; border: 1px solid #bbdefb;")
+        self.temp_label.setFont(QFont("Arial", 12))
+        self.temp_label.setStyleSheet("padding: 8px; background-color: #e3f2fd; border-radius: 5px; border: 1px solid #bbdefb;")
         current_info_layout.addWidget(self.temp_label)
         
         self.recommendation_label = QLabel("Recommendation: --")
-        self.recommendation_label.setFont(QFont("Arial", 10, QFont.Bold))
-        self.recommendation_label.setWordWrap(True)
-        self.recommendation_label.setMinimumWidth(0)
-        self.recommendation_label.setStyleSheet("color: #0066cc; padding: 5px; background-color: #fff3e0; border-radius: 5px; border: 1px solid #ffe0b2;")
+        self.recommendation_label.setFont(QFont("Arial", 12, QFont.Bold))
+        self.recommendation_label.setStyleSheet("color: #0066cc; padding: 8px; background-color: #fff3e0; border-radius: 5px; border: 1px solid #ffe0b2;")
         current_info_layout.addWidget(self.recommendation_label)
-
+        
+        # Time and date display
+        self.date_label = QLabel()
+        self.date_label.setFont(QFont("Arial", 12, QFont.Bold))
+        self.date_label.setStyleSheet("padding: 8px; background-color: #e8f5e9; border-radius: 5px; border: 1px solid #c8e6c9;")
+        self.date_label.setAlignment(Qt.AlignCenter)
+        current_info_layout.addWidget(self.date_label)
+        
+        self.time_label = QLabel()
+        self.time_label.setFont(QFont("Arial", 12, QFont.Bold))
+        self.time_label.setStyleSheet("padding: 8px; background-color: #e8f5e9; border-radius: 5px; border: 1px solid #c8e6c9;")
+        self.time_label.setAlignment(Qt.AlignCenter)
+        current_info_layout.addWidget(self.time_label)
+        
         current_info_group.setLayout(current_info_layout)
         right_panel.addWidget(current_info_group)
         
@@ -589,32 +523,30 @@ class MainWindow(QMainWindow):
         model_group = QGroupBox("Detection Model")
         model_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 5px; margin-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
         model_layout = QVBoxLayout()
-        model_layout.setSpacing(4)
-        model_layout.setContentsMargins(8, 8, 8, 8)
+        model_layout.setSpacing(6)
+        model_layout.setContentsMargins(10, 10, 10, 10)
         
         self.model_label = QLabel("Model: loading...")
-        self.model_label.setFont(QFont("Arial", 9, QFont.Bold))
+        self.model_label.setFont(QFont("Arial", 10, QFont.Bold))
         self.model_label.setWordWrap(True)
-        self.model_label.setStyleSheet("padding: 4px; background-color: #ede7f6; border-radius: 5px; border: 1px solid #d1c4e9;")
+        self.model_label.setStyleSheet("padding: 6px; background-color: #ede7f6; border-radius: 5px; border: 1px solid #d1c4e9;")
         model_layout.addWidget(self.model_label)
         
         self.model_detail_label = QLabel("Backend: --")
-        self.model_detail_label.setFont(QFont("Arial", 8))
+        self.model_detail_label.setFont(QFont("Arial", 9))
         self.model_detail_label.setWordWrap(True)
-        self.model_detail_label.setMinimumWidth(0)
-        self.model_detail_label.setStyleSheet("padding: 4px; background-color: #f3e5f5; border-radius: 5px; border: 1px solid #e1bee7; color: #444;")
+        self.model_detail_label.setStyleSheet("padding: 6px; background-color: #f3e5f5; border-radius: 5px; border: 1px solid #e1bee7; color: #444;")
         model_layout.addWidget(self.model_detail_label)
         
         self.performance_label = QLabel("Inference: -- ms   |   Rate: -- /s")
-        self.performance_label.setFont(QFont("Consolas", 8))
-        self.performance_label.setStyleSheet("padding: 4px; background-color: #fff8e1; border-radius: 5px; border: 1px solid #ffecb3;")
+        self.performance_label.setFont(QFont("Consolas", 9))
+        self.performance_label.setStyleSheet("padding: 6px; background-color: #fff8e1; border-radius: 5px; border: 1px solid #ffecb3;")
         model_layout.addWidget(self.performance_label)
         
         self.model_warning_label = QLabel()
-        self.model_warning_label.setFont(QFont("Arial", 8, QFont.Bold))
+        self.model_warning_label.setFont(QFont("Arial", 9, QFont.Bold))
         self.model_warning_label.setWordWrap(True)
-        self.model_warning_label.setMinimumWidth(0)
-        self.model_warning_label.setStyleSheet("padding: 4px; background-color: #ffebee; border-radius: 5px; border: 1px solid #ef9a9a; color: #b71c1c;")
+        self.model_warning_label.setStyleSheet("padding: 6px; background-color: #ffebee; border-radius: 5px; border: 1px solid #ef9a9a; color: #b71c1c;")
         self.model_warning_label.setVisible(False)
         model_layout.addWidget(self.model_warning_label)
         
@@ -625,22 +557,63 @@ class MainWindow(QMainWindow):
         log_group = QGroupBox("Detection Log")
         log_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 5px; margin-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
         log_layout = QVBoxLayout()
-        log_layout.setContentsMargins(4, 4, 4, 4)
+        log_layout.setContentsMargins(5, 5, 5, 5)
         
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setStyleSheet("font-family: Consolas, monospace; font-size: 9px; background-color: #f9f9f9; border: 1px solid #ddd; border-radius: 3px;")
+        self.log_text.setStyleSheet("font-family: Consolas, monospace; font-size: 11px; background-color: #f9f9f9; border: 1px solid #ddd; border-radius: 3px;")
         log_layout.addWidget(self.log_text)
         
         log_group.setLayout(log_layout)
         right_panel.addWidget(log_group)
 
+    def setup_detection_info_tab(self):
+        layout = QVBoxLayout()
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+        self.detection_info_tab.setLayout(layout)
+        
+        # Detection history table
+        table_group = QGroupBox("Detection History")
+        table_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 5px; margin-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
+        table_layout = QVBoxLayout()
+        table_layout.setContentsMargins(5, 5, 5, 5)
+        
+        self.detection_table = QTableWidget()
+        self.detection_table.setColumnCount(4)
+        self.detection_table.setHorizontalHeaderLabels(["Date and Timestamp", "Count", "Temperature", "Recommendation"])
+        self.detection_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.detection_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.detection_table.setStyleSheet("""
+            QTableWidget {
+                border: 1px solid #ddd;
+                border-radius: 3px;
+                background-color: white;
+                gridline-color: #eee;
+            }
+            QTableWidget::item {
+                padding: 5px;
+                border-bottom: 1px solid #eee;
+            }
+            QHeaderView::section {
+                background-color: #f5f5f5;
+                padding: 8px;
+                border: 1px solid #ddd;
+                font-weight: bold;
+                color: #333;
+            }
+        """)
+        table_layout.addWidget(self.detection_table)
+        
+        table_group.setLayout(table_layout)
+        layout.addWidget(table_group)
+
     def setup_scan_history_tab(self):
         layout = QVBoxLayout()
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(6)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
         self.scan_history_tab.setLayout(layout)
-
+        
         table_style = """
             QTableWidget {
                 border: 1px solid #ddd;
@@ -648,16 +621,21 @@ class MainWindow(QMainWindow):
                 background-color: white;
                 gridline-color: #eee;
             }
-            QTableWidget::item { padding: 3px; border-bottom: 1px solid #eee; }
+            QTableWidget::item { padding: 5px; border-bottom: 1px solid #eee; }
             QHeaderView::section {
                 background-color: #f5f5f5;
-                padding: 5px;
+                padding: 8px;
                 border: 1px solid #ddd;
                 font-weight: bold;
                 color: #333;
             }
         """
-
+        
+        self.db_status_label = QLabel("Database: --")
+        self.db_status_label.setFont(QFont("Arial", 10, QFont.Bold))
+        self.db_status_label.setStyleSheet("padding: 8px; background-color: #e3f2fd; border-radius: 5px; border: 1px solid #bbdefb;")
+        layout.addWidget(self.db_status_label)
+        
         splitter = QSplitter(Qt.Horizontal)
         layout.addWidget(splitter, stretch=1)
         
@@ -665,12 +643,12 @@ class MainWindow(QMainWindow):
         scans_group = QGroupBox("Stored Scans")
         scans_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 5px; margin-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
         scans_layout = QVBoxLayout()
-        scans_layout.setContentsMargins(4, 4, 4, 4)
+        scans_layout.setContentsMargins(5, 5, 5, 5)
         
         self.scan_table = QTableWidget()
-        self.scan_table.setColumnCount(5)
+        self.scan_table.setColumnCount(7)
         self.scan_table.setHorizontalHeaderLabels(
-            ["Scan ID", "Start Time", "Max Count", "Avg Temp", "Images"])
+            ["Scan ID", "Start Time", "Max Count", "Avg Temp", "Log Rows", "Images", "Report"])
         self.scan_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.scan_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.scan_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -686,18 +664,18 @@ class MainWindow(QMainWindow):
         detail_group = QGroupBox("Stored Detection Log and Images")
         detail_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 5px; margin-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
         detail_layout = QVBoxLayout()
-        detail_layout.setContentsMargins(4, 4, 4, 4)
-        detail_layout.setSpacing(5)
+        detail_layout.setContentsMargins(5, 5, 5, 5)
+        detail_layout.setSpacing(8)
         
         self.image_preview_label = QLabel("Select a scan to preview its stored images")
-        self.image_preview_label.setMinimumHeight(120)
+        self.image_preview_label.setMinimumHeight(200)
         self.image_preview_label.setAlignment(Qt.AlignCenter)
         self.image_preview_label.setStyleSheet("border: 2px solid #333; background-color: #000; color: #999; border-radius: 5px;")
         detail_layout.addWidget(self.image_preview_label, stretch=2)
         
         self.image_list = QListWidget()
-        self.image_list.setMaximumHeight(80)
-        self.image_list.setStyleSheet("font-family: Consolas, monospace; font-size: 9px; border: 1px solid #ddd; border-radius: 3px;")
+        self.image_list.setMaximumHeight(120)
+        self.image_list.setStyleSheet("font-family: Consolas, monospace; font-size: 10px; border: 1px solid #ddd; border-radius: 3px;")
         self.image_list.currentRowChanged.connect(self.on_history_image_selected)
         detail_layout.addWidget(self.image_list, stretch=1)
         
@@ -711,25 +689,23 @@ class MainWindow(QMainWindow):
         
         detail_group.setLayout(detail_layout)
         splitter.addWidget(detail_group)
-        splitter.setSizes([520, 420])
+        splitter.setSizes([600, 500])
         
-        # Actions - the merged tab keeps Refresh, Email Selected Scan Report and
-        # Open Scans Folder. The manual "Export Zip from Database" button was removed
-        # because the email already delivers the same archive automatically.
+        # Actions
         button_row = QHBoxLayout()
-        button_row.setSpacing(6)
+        button_row.setSpacing(8)
         
         def make_button(text, color, hover, handler):
             button = QPushButton(text)
-            button.setMinimumHeight(30)
+            button.setMinimumHeight(38)
             button.setStyleSheet(f"""
                 QPushButton {{
                     background-color: {color};
                     color: white;
-                    font-size: 11px;
+                    font-size: 13px;
                     font-weight: bold;
                     border-radius: 5px;
-                    padding: 5px;
+                    padding: 6px;
                 }}
                 QPushButton:hover {{ background-color: {hover}; }}
                 QPushButton:disabled {{ background-color: #bdbdbd; }}
@@ -739,6 +715,10 @@ class MainWindow(QMainWindow):
             return button
         
         self.refresh_history_button = make_button("Refresh", "#2196F3", "#1976D2", self.refresh_scan_history)
+        self.resend_report_button = make_button("Email Selected Scan Report", "#4CAF50", "#45a049",
+                                                self.resend_selected_report)
+        self.export_report_button = make_button("Export Zip from Database", "#FF9800", "#F57C00",
+                                                self.export_selected_report)
         self.open_scans_folder_button = make_button("Open Scans Folder", "#607D8B", "#455A64",
                                                    self.view_previous_scans)
         layout.addLayout(button_row)
@@ -754,22 +734,17 @@ class MainWindow(QMainWindow):
             self.log_message("Failed to initialize YOLOv11 detector")
         self.update_model_display()
         
-        # Initialize temperature sensor (DS18B20 over 1-Wire, polled in its own thread)
+        # Initialize temperature sensor
         if self.temp_sensor.initialize():
-            status = self.temp_sensor.get_status()
-            self.log_message(f"DS18B20 temperature sensor ready: {status['device_id']} "
-                             f"(polling every {status['poll_interval']:g}s)")
+            self.log_message("Temperature sensor initialized")
         else:
-            self.log_message(f"DS18B20 not available - {self.temp_sensor.last_error}")
+            self.log_message("Temperature sensor not available")
         
-        # Initialize LED controller (WS2813; SPI on Pi 5, rpi_ws281x on Pi 4 and older)
-        self.led_controller.initialize()
-        led_status = self.led_controller.get_status()
-        if led_status['backend'] == 'simulation':
-            self.log_message(f"WS2813 LEDs in simulation mode - {led_status['error']}")
+        # Initialize LED controller
+        if self.led_controller.initialize():
+            self.log_message("LED controller initialized")
         else:
-            self.log_message(f"WS2813 LEDs ready: {led_status['led_count']} pixels via "
-                             f"{led_status['backend']}, brightness {led_status['brightness']}")
+            self.log_message("LED controller not available")
         
         # Initialize logger
         if self.logger.initialize():
@@ -806,16 +781,10 @@ class MainWindow(QMainWindow):
         warning = info['warning']
         if not info['initialized']:
             warning = warning or "Model failed to load - no detections will be recorded."
-        # Break long unbreakable tokens (e.g. the re-export command) so the label
-        # can wrap inside the narrow right panel instead of forcing the window wide.
-        if warning:
-            warning = (warning
-                       .replace(").export(", ")\n.export(")
-                       .replace("YOLO('", "YOLO(\n'"))
         self.model_warning_label.setText(warning or "")
         self.model_warning_label.setVisible(bool(warning))
         if warning:
-            self.log_message(f"MODEL WARNING: {info['warning']}")
+            self.log_message(f"MODEL WARNING: {warning}")
 
     def update_performance_stats(self, rate_per_second: float, avg_inference_ms: float):
         self.performance_label.setText(
@@ -833,15 +802,14 @@ class MainWindow(QMainWindow):
             return
         
         # Create scan folder with timestamp
-        # Scan ID format: scan_YYYY-MM-DD_HH-MM-SS (readable, sortable, Year-Month-Date order)
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.current_scan_folder = os.path.join(self.previous_scans_dir, f"scan_{timestamp}")
         os.makedirs(self.current_scan_folder, exist_ok=True)
-
+        
         # Dedicated folder for the captured images of detected rice weevils
         self.scan_images_dir = os.path.join(self.current_scan_folder, "detected_images")
         os.makedirs(self.scan_images_dir, exist_ok=True)
-
+        
         # Generate scan ID for database
         self.current_scan_id = f"scan_{timestamp}"
         
@@ -894,7 +862,6 @@ class MainWindow(QMainWindow):
         self.last_image_capture_time = None
         self.last_log_time = None
         self.last_significant_log_time = None
-        self._last_temp_sample_id = None
         
         self.is_scanning = True
         self.start_button.setText("Stop Scan")
@@ -981,49 +948,52 @@ class MainWindow(QMainWindow):
             self.email_scan_report(scan_id)
             self.refresh_scan_history()
 
-    def email_scan_report(self, scan_id: str) -> Optional[str]:
-        """Build the report archive from the database and email it automatically.
-
-        Called when a scan stops (either the user clicked Stop Scan or the 3-minute
-        protocol timer elapsed). Everything in the archive - the detection log CSV
-        and the captured rice weevil images - is read back out of SQLite.
+    def email_scan_report(self, scan_id: str, interactive: bool = False) -> Optional[str]:
+        """Build the report archive from the database and email it.
+        
+        Everything in the archive - the detection log CSV and the captured rice weevil
+        images - is read back out of SQLite, so this works for any past scan too.
         """
         video_paths = [p for p in (getattr(self, 'left_video_path', None),
                                    getattr(self, 'right_video_path', None)) if p]
         scan = self.db.get_scan_by_id(scan_id)
         if scan and not video_paths:
             video_paths = [p for p in (scan.get('left_video_path'), scan.get('right_video_path')) if p]
-
+        
         zip_path = os.path.join(self.reports_dir, f"{scan_id}_report.zip")
         max_bytes = int(self.email_notifier.max_attachment_mb * 1024 * 1024)
-
+        
         try:
             archive_path, info = report_builder.build_scan_archive(
                 self.db, scan_id, zip_path, video_paths=video_paths, max_bytes=max_bytes)
         except Exception as e:
             self.log_message(f"Error building scan archive from database: {e}")
             return None
-
+        
         if not archive_path:
             self.log_message(f"Could not build archive: {info.get('error')}")
             return None
-
+        
         self.log_message(
             f"Scan archive built from database: {os.path.basename(archive_path)} "
             f"({info['archive_bytes'] / (1024 * 1024):.2f} MB, {info['log_entry_count']} log entries, "
             f"{info['image_count']} images, videos {'included' if info['included_videos'] else 'excluded'})")
-
+        
         summary = report_builder.build_scan_summary(self.db, scan_id) or {}
         report_id = self.db.create_report(
             scan_id, self.email_notifier.recipient_email, info['archive_name'],
             info['archive_bytes'], info['image_count'], info['log_entry_count'],
             info['included_videos'])
-
+        
         if not self.email_notifier.enabled:
             self.db.update_report_status(report_id, 'skipped', 'email disabled or not configured')
             self.log_message("Email disabled - archive saved locally and recorded in the database")
+            if interactive:
+                QMessageBox.information(self, "Email disabled",
+                                        f"Archive saved to:\n{archive_path}\n\n"
+                                        "Email is disabled or not configured in config.env.")
             return archive_path
-
+        
         self.log_message(f"Emailing scan report to {self.email_notifier.recipient_email}...")
         self.send_email_async(f"Scan Report {scan_id}", self.email_notifier.send_scan_report,
                               scan_id, archive_path, summary, report_id=report_id)
@@ -1047,13 +1017,19 @@ class MainWindow(QMainWindow):
             self.refresh_scan_history()
 
     def refresh_scan_history(self):
-        """Reload the Detection Logs tab from the database."""
+        """Reload the Scan History tab from the database."""
         try:
             scans = self.db.get_scan_overview()
         except Exception as e:
             self.log_message(f"Error reading scan history: {e}")
             return
-
+        
+        total_images = sum(s.get('image_count') or 0 for s in scans)
+        total_logs = sum(s.get('detection_count') or 0 for s in scans)
+        self.db_status_label.setText(
+            f"Database: {self.db.db_path}   |   {len(scans)} scans   |   {total_logs} log rows   |   "
+            f"{total_images} stored images   |   file size {self.db.get_database_size() / (1024 * 1024):.2f} MB")
+        
         self.scan_table.setRowCount(0)
         for scan in scans:
             row = self.scan_table.rowCount()
@@ -1064,7 +1040,9 @@ class MainWindow(QMainWindow):
                 scan.get('start_time', ''),
                 str(scan.get('max_weevil_count', 0)),
                 f"{avg_temp:.1f}°C" if isinstance(avg_temp, (int, float)) else "N/A",
+                str(scan.get('detection_count', 0)),
                 f"{scan.get('image_count', 0)} ({(scan.get('image_total_bytes') or 0) / 1024:.0f} KB)",
+                scan.get('report_status') or '-',
             ]
             for col, value in enumerate(values):
                 self.scan_table.setItem(row, col, QTableWidgetItem(value))
@@ -1145,6 +1123,48 @@ class MainWindow(QMainWindow):
         self.image_preview_label.setPixmap(
             pixmap.scaled(self.image_preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
+    def resend_selected_report(self):
+        """Rebuild the selected scan's archive from the database and email it again."""
+        scan_id = self.selected_scan_id()
+        if not scan_id:
+            QMessageBox.information(self, "No scan selected", "Select a scan in the table first.")
+            return
+        self.log_message(f"Rebuilding and emailing report for {scan_id} from the database...")
+        self.email_scan_report(scan_id, interactive=True)
+        self.refresh_scan_history()
+
+    def export_selected_report(self):
+        """Save the database-built archive for the selected scan to a chosen location."""
+        scan_id = self.selected_scan_id()
+        if not scan_id:
+            QMessageBox.information(self, "No scan selected", "Select a scan in the table first.")
+            return
+        
+        target, _ = QFileDialog.getSaveFileName(self, "Export scan report",
+                                                os.path.join(self.reports_dir, f"{scan_id}_report.zip"),
+                                                "Zip archives (*.zip)")
+        if not target:
+            return
+        
+        scan = self.db.get_scan_by_id(scan_id) or {}
+        video_paths = [p for p in (scan.get('left_video_path'), scan.get('right_video_path')) if p]
+        try:
+            archive_path, info = report_builder.build_scan_archive(
+                self.db, scan_id, target, video_paths=video_paths)
+        except Exception as e:
+            QMessageBox.warning(self, "Export failed", str(e))
+            return
+        
+        if not archive_path:
+            QMessageBox.warning(self, "Export failed", str(info.get('error')))
+            return
+        
+        self.log_message(f"Exported {info['archive_name']} "
+                         f"({info['archive_bytes'] / (1024 * 1024):.2f} MB) from the database")
+        QMessageBox.information(self, "Export complete",
+                                f"{info['log_entry_count']} log entries and {info['image_count']} images "
+                                f"written to:\n{archive_path}")
+
     def view_previous_scans(self):
         # Open the previous scans folder in the system file explorer
         import subprocess
@@ -1166,7 +1186,7 @@ class MainWindow(QMainWindow):
         """Save scan metadata to database and JSON file, returning the summary."""
         import json
         
-        if not self.current_scan_id:
+        if not self.current_scan_folder or not self.current_scan_id:
             return None
         
         # Calculate average temperature
@@ -1198,8 +1218,6 @@ class MainWindow(QMainWindow):
                 "classes": model_info['classes'],
             },
             "avg_inference_ms": round(self.detector.avg_inference_ms, 1),
-            "temperature_sensor": self.temp_sensor.get_status(),
-            "led_controller": self.led_controller.get_status(),
             "videos": {
                 "left_camera": "left_camera.mp4",
                 "right_camera": "right_camera.mp4"
@@ -1216,33 +1234,24 @@ class MainWindow(QMainWindow):
             json.dumps(metadata)
         )
         
-        # Also drop a copy next to the recordings for offline inspection. This is
-        # best-effort: losing the scan folder (e.g. the external SSD unmounting) must
-        # not cost us the database record written above.
-        if self.current_scan_folder:
-            try:
-                metadata_path = os.path.join(self.current_scan_folder, "scan_metadata.json")
-                with open(metadata_path, 'w') as f:
-                    json.dump(metadata, f, indent=4)
-            except OSError as e:
-                self.log_message(f"Could not write scan_metadata.json ({e}); "
-                                 "the database record was saved regardless")
+        # Also drop a copy next to the recordings for offline inspection
+        metadata_path = os.path.join(self.current_scan_folder, "scan_metadata.json")
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=4)
         
         self.log_message(f"Scan metadata saved to database ({self.scan_detection_count} log entries, "
                          f"{image_count} images stored)")
         return metadata
 
     def set_red_light(self):
-        applied = self.led_controller.set_red()
-        suffix = "" if applied else " (simulated - no LED hardware)"
-        self.log_message(f"Red light activated{suffix}")
+        self.led_controller.set_red()
+        self.log_message("Red light activated")
         self.send_email_async("LED Control", self.email_notifier.send_activity_log,
                               "LED Control", "Red light activated to lure rice weevils")
 
     def set_white_light(self):
-        applied = self.led_controller.set_white()
-        suffix = "" if applied else " (simulated - no LED hardware)"
-        self.log_message(f"White light activated{suffix}")
+        self.led_controller.set_white()
+        self.log_message("White light activated")
         self.send_email_async("LED Control", self.email_notifier.send_activity_log,
                               "LED Control", "White light activated for detection")
 
@@ -1277,79 +1286,50 @@ class MainWindow(QMainWindow):
             self.log_message("Marked as before mixing/sifting")
 
     def set_leds_off(self):
-        applied = self.led_controller.off()
-        suffix = "" if applied else " (simulated - no LED hardware)"
-        self.log_message(f"LEDs turned off{suffix}")
+        self.led_controller.off()
+        self.log_message("LEDs turned off")
         self.send_email_async("LED Control", self.email_notifier.send_activity_log,
                               "LED Control", "LEDs turned off")
-
-    def adjust_zoom(self, side: str, direction: int):
-        """Adjust the digital zoom factor for the left or right camera feed.
-
-        direction = +1 zooms in, -1 zooms out. The zoom is display-only: the
-        recorded video and stored images always keep the full frame.
-        """
-        attr = f"{side}_zoom"
-        current = getattr(self, attr)
-        new = round(current + direction * self.zoom_step, 2)
-        new = max(self.zoom_min, min(self.zoom_max, new))
-        setattr(self, attr, new)
-        label = getattr(self, f"{side}_zoom_label")
-        label.setText(f"{new:.1f}x")
-        # Re-render the last frame at the new zoom level if we have one
-        latest = getattr(self, f"latest_annotated_{'left' if side == 'left' else 'right'}")
-        if latest is not None:
-            target_label = self.left_camera_label if side == 'left' else self.right_camera_label
-            self._render_frame_to_label(latest, target_label, new)
-
-    def _render_frame_to_label(self, frame: np.ndarray, label, zoom: float):
-        """Render a BGR frame to a QLabel, applying the given digital zoom.
-
-        Zoom is a center crop: at 2.0x, the central half of the frame (width and
-        height) is scaled up to fill the label. This keeps the region of interest
-        (the rice sample) centered.
-        """
-        rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        if zoom > 1.0:
-            h, w = rgb_image.shape[:2]
-            crop_w = int(w / zoom)
-            crop_h = int(h / zoom)
-            x0 = (w - crop_w) // 2
-            y0 = (h - crop_h) // 2
-            rgb_image = rgb_image[y0:y0 + crop_h, x0:x0 + crop_w]
-            # Slicing produces a non-contiguous view; QImage needs a contiguous buffer
-            rgb_image = np.ascontiguousarray(rgb_image)
-
-        h, w, ch = rgb_image.shape
-        bytes_per_line = ch * w
-        qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(qt_image)
-        scaled_pixmap = pixmap.scaled(label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        label.setPixmap(scaled_pixmap)
 
     def update_left_frame(self, frame: np.ndarray, detection: DetectionResult):
         # Draw detections on frame
         annotated_frame = self.detector.draw_detections(frame, detection)
         self.latest_annotated_left = annotated_frame
         
-        # Write to video file if recording (always full frame, not zoomed)
+        # Write to video file if recording
         if self.video_writer_left and self.video_writer_left.isOpened():
             self.video_writer_left.write(annotated_frame)
-
-        # Display with current zoom level (display-only; recording keeps full frame)
-        self._render_frame_to_label(annotated_frame, self.left_camera_label, self.left_zoom)
+        
+        # Convert to QImage
+        rgb_image = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb_image.shape
+        bytes_per_line = ch * w
+        qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        
+        # Scale to fit label
+        pixmap = QPixmap.fromImage(qt_image)
+        scaled_pixmap = pixmap.scaled(self.left_camera_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.left_camera_label.setPixmap(scaled_pixmap)
 
     def update_right_frame(self, frame: np.ndarray, detection: DetectionResult):
         # Draw detections on frame
         annotated_frame = self.detector.draw_detections(frame, detection)
         self.latest_annotated_right = annotated_frame
-
-        # Write to video file if recording (always full frame, not zoomed)
+        
+        # Write to video file if recording
         if self.video_writer_right and self.video_writer_right.isOpened():
             self.video_writer_right.write(annotated_frame)
-
-        # Display with current zoom level (display-only; recording keeps full frame)
-        self._render_frame_to_label(annotated_frame, self.right_camera_label, self.right_zoom)
+        
+        # Convert to QImage
+        rgb_image = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb_image.shape
+        bytes_per_line = ch * w
+        qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        
+        # Scale to fit label
+        pixmap = QPixmap.fromImage(qt_image)
+        scaled_pixmap = pixmap.scaled(self.right_camera_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.right_camera_label.setPixmap(scaled_pixmap)
 
     def update_detection(self, count: int, confidence: float, activity: str):
         # Update count label (always update real-time)
@@ -1357,19 +1337,15 @@ class MainWindow(QMainWindow):
         self.confidence_label.setText(
             f"Avg Confidence: {confidence * 100:.1f}%" if confidence else "Avg Confidence: --")
         
-        # Get temperature (cached; the DS18B20 is polled in its own thread)
-        sample_id, temperature = self.temp_sensor.read_sample()
+        # Get temperature
+        temperature = self.temp_sensor.read_temperature()
         
         # Track scan metadata
         if self.is_scanning:
             if count > self.scan_max_count:
                 self.scan_max_count = count
-            # Detection cycles run far faster than the sensor converts, so only count
-            # each physical conversion once - otherwise the scan average is weighted by
-            # how long a reading happened to sit in the cache.
-            if temperature is not None and sample_id != self._last_temp_sample_id:
+            if temperature is not None:
                 self.scan_temp_readings.append(temperature)
-                self._last_temp_sample_id = sample_id
         
         current_time = datetime.now()
         # "Significant" means a noticeably high reading, not merely a non-zero one.
@@ -1421,6 +1397,7 @@ class MainWindow(QMainWindow):
             marker = "HIGH COUNT " if should_log_significant else ""
             self.log_message(f"{marker}{log_entry.timestamp} - Count: {count}, Temp: {temp_str}, "
                              f"Rec: {log_entry.recommendation}")
+            self.add_detection_to_table(log_entry.timestamp, count, temperature, log_entry.recommendation)
             self.last_log_time = current_time
             if should_log_significant:
                 self.last_significant_log_time = current_time
@@ -1482,39 +1459,39 @@ class MainWindow(QMainWindow):
                              f"stored {len(saved)} image(s) in database")
         return saved
 
-    def update_temperature(self):
-        """Refresh the temperature readout. Non-blocking: the DS18B20 is polled in
-        its own thread, so this only reads the cached value."""
-        temperature = self.temp_sensor.read_temperature()
-        status = self.temp_sensor.get_status()
+    def add_detection_to_table(self, timestamp: str, count: int, temperature: Optional[float], recommendation: str):
+        temp_str = f"{temperature:.1f}°C" if temperature is not None else "N/A"
         
+        row_position = self.detection_table.rowCount()
+        self.detection_table.insertRow(row_position)
+        
+        self.detection_table.setItem(row_position, 0, QTableWidgetItem(timestamp))
+        self.detection_table.setItem(row_position, 1, QTableWidgetItem(str(count)))
+        self.detection_table.setItem(row_position, 2, QTableWidgetItem(temp_str))
+        self.detection_table.setItem(row_position, 3, QTableWidgetItem(recommendation))
+        
+        # Auto-scroll to bottom
+        self.detection_table.scrollToBottom()
+        
+        # Limit table to last 100 entries
+        if self.detection_table.rowCount() > 100:
+            self.detection_table.removeRow(0)
+
+    def update_temperature(self):
+        temperature = self.temp_sensor.read_temperature()
         if temperature is not None:
             self.temp_label.setText(f"Temperature: {temperature:.1f}°C")
-            self.temp_label.setStyleSheet(
-                "padding: 8px; background-color: #e3f2fd; border-radius: 5px; border: 1px solid #bbdefb;")
-        elif not status['available']:
-            self.temp_label.setText("Temperature: sensor not detected")
-            self.temp_label.setStyleSheet(
-                "padding: 8px; background-color: #ffebee; border-radius: 5px; border: 1px solid #ef9a9a; color: #b71c1c;")
-        else:
-            self.temp_label.setText("Temperature: no recent reading")
-            self.temp_label.setStyleSheet(
-                "padding: 8px; background-color: #fff8e1; border-radius: 5px; border: 1px solid #ffecb3; color: #8d6e00;")
-        
-        # Surface a sensor fault once rather than on every tick
-        error = status.get('last_error')
-        if error and error != getattr(self, '_last_temp_error', None):
-            self.log_message(f"Temperature sensor: {error}")
-        self._last_temp_error = error
     
     def update_clock(self):
+        from datetime import datetime
         now = datetime.now()
         # Format: June 25, 2026 9:31:45 PM
         date_str = now.strftime("%B %d, %Y")
         time_str = now.strftime("%I:%M:%S %p")
-        # The header clock stays visible on every tab, so a separate date/time
-        # panel on Live Feed would only duplicate it.
-        self.header_clock_label.setText(f"{date_str}   {time_str}")
+        
+        # Update date and time labels on Live Feed tab
+        self.date_label.setText(f"Date: {date_str}")
+        self.time_label.setText(f"Time: {time_str}")
 
     def log_message(self, message: str):
         self.log_text.append(message)
@@ -1529,7 +1506,6 @@ class MainWindow(QMainWindow):
         for thread in list(self.email_threads):
             thread.wait(90000)
         self.led_controller.cleanup()
-        self.temp_sensor.cleanup()
         event.accept()
 
 
