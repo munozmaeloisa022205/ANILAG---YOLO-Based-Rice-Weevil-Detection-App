@@ -116,11 +116,15 @@ def build_scan_archive(db: DatabaseManager, scan_id: str, output_path: str,
         with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             zf.writestr(DETECTION_LOG_NAME, csv_text)
             zf.writestr(METADATA_NAME, metadata_text)
+            # Always create the detected_images/ folder so the recipient sees the
+            # expected structure even when no images were captured.
+            zf.writestr(f"{IMAGE_DIR_NAME}/", "")
             for image in images:
                 blob = image.get('image_blob')
                 if blob:
                     zf.writestr(f"{IMAGE_DIR_NAME}/{image['filename']}", bytes(blob))
             if include_videos:
+                zf.writestr(f"{VIDEO_DIR_NAME}/", "")
                 for path in existing_videos:
                     zf.write(path, f"{VIDEO_DIR_NAME}/{os.path.basename(path)}")
 

@@ -12,11 +12,14 @@ from src.detection.yolov11_detector import YOLOv11Detector, DetectionResult
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLabel, QTextEdit, QGroupBox,
                              QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
-                             QListWidget, QListWidgetItem, QSplitter)
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread
+                             QListWidget, QListWidgetItem, QSplitter, QSizePolicy,
+                             QMessageBox)
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QObject
 from PyQt5.QtGui import QImage, QPixmap, QFont, QIcon
-from typing import Optional
+from typing import Optional, TextIO
+import io
 import os
+import shutil
 import time
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -36,6 +39,7 @@ class DetectionThread(QThread):
     frame_ready_right = pyqtSignal(np.ndarray, DetectionResult)
     detection_update = pyqtSignal(int, float, str)
     stats_update = pyqtSignal(float, float)  # detections per second, avg inference ms
+    camera_status = pyqtSignal(bool, bool)  # left has live signal, right has live signal
 
     def __init__(self, camera_manager: DualCameraManager, detector: YOLOv11Detector,
                  interval_ms: int = 200):
@@ -52,8 +56,16 @@ class DetectionThread(QThread):
         self.running = True
         while self.running:
             cycle_started = time.perf_counter()
-            left_frame = self.camera_manager.get_left_frame()
-            right_frame = self.camera_manager.get_right_frame()
+
+            # Only run inference on cameras that are actually producing frames.
+            # On Windows a non-existent camera can open but never deliver a real
+            # frame; without this guard the model would detect on stale/garbage
+            # data and report phantom weevil counts.
+            left_healthy = self.camera_manager.is_left_healthy()
+            right_healthy = self.camera_manager.is_right_healthy()
+            self.camera_status.emit(left_healthy, right_healthy)
+            left_frame = self.camera_manager.get_left_frame() if left_healthy else None
+            right_frame = self.camera_manager.get_right_frame() if right_healthy else None
 
             # Emit combined detection update
             total_count = 0
@@ -86,6 +98,36 @@ class DetectionThread(QThread):
         self.wait()
 
 
+class ConsoleLogStream(QObject):
+    """Tee stdout/stderr so every print() also appears in the System Log.
+
+    print() is called from background threads (camera capture loop, email
+    thread, etc.), so a Qt signal is used to marshal the text to the GUI
+    thread safely.
+    """
+    line_printed = pyqtSignal(str)
+
+    def __init__(self, original: TextIO):
+        super().__init__()
+        self._original = original
+        self._buffer = ""
+
+    def write(self, text: str) -> int:
+        self._original.write(text)
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            if line.strip():
+                self.line_printed.emit(line)
+        return len(text)
+
+    def flush(self):
+        self._original.flush()
+        if self._buffer.strip():
+            self.line_printed.emit(self._buffer)
+            self._buffer = ""
+
+
 class EmailThread(QThread):
     """Runs an EmailNotifier call off the UI thread so SMTP never freezes the GUI."""
     finished_with_status = pyqtSignal(bool, str)
@@ -108,29 +150,61 @@ class EmailThread(QThread):
 class CameraLabel(QLabel):
     """A QLabel that keeps its zoom control panel pinned to the right edge
     inside the frame when the label (and its pixmap) is resized."""
+    ZOOM_PANEL_MARGIN = 10
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.zoom_panel = None
 
+    def position_zoom_panel(self):
+        """Pin the panel to the right edge, vertically centered, fully inside the frame."""
+        panel = self.zoom_panel
+        if panel is None:
+            return
+        x = self.width() - panel.width() - self.ZOOM_PANEL_MARGIN
+        y = (self.height() - panel.height()) // 2
+        panel.move(max(self.ZOOM_PANEL_MARGIN, x), max(self.ZOOM_PANEL_MARGIN, y))
+        panel.raise_()
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self.zoom_panel is not None:
-            pw = self.zoom_panel.width()
-            ph = self.zoom_panel.height()
-            # Pin to the right edge, vertically centered
-            x = self.width() - pw - 6
-            y = (self.height() - ph) // 2
-            self.zoom_panel.move(max(2, x), max(2, y))
-            self.zoom_panel.raise_()
+        self.position_zoom_panel()
+
+    def showEvent(self, event):
+        # The hidden tab never gets a resize until it is first shown, so place the
+        # panel here too - otherwise it sits in the top-left corner over the title.
+        super().showEvent(event)
+        self.position_zoom_panel()
 
 
 class MainWindow(QMainWindow):
+    # Touch target sizing for the 7-inch (1024x600) Raspberry Pi touchscreen.
+    # 64px is roughly a 9mm square on that panel - comfortably finger-sized.
+    TOUCH_BUTTON_SIZE = 64
+    # Overlay zoom buttons are smaller than the main controls but still touchable.
+    ZOOM_BUTTON_SIZE = 44
+    # Width reserved for the shared info column so the camera feed keeps the rest.
+    INFO_PANEL_WIDTH = 250
+    # Table/list rows in the Detection Logs tab are selected by finger, so they need
+    # to be at least this tall to be reliably tappable on the 7-inch panel.
+    TOUCH_ROW_HEIGHT = 44
+    # Scrollbars are dragged by finger, so they are far wider than the desktop default.
+    TOUCH_SCROLLBAR_SIZE = 22
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Anilag - Rice Weevil Detection System")
         # Target display is the Raspberry Pi 5 touchscreen at 1024x600.
         self.setGeometry(50, 50, 1024, 600)
         self.setMinimumSize(800, 480)
+
+        # Tee stdout/stderr into the System Log so every print() from any
+        # module (camera, detector, email, LED, temperature) appears in the
+        # GUI just like it does in the terminal.
+        self._console_stream = ConsoleLogStream(sys.stdout)
+        self._console_stream_err = ConsoleLogStream(sys.stderr)
+        sys.stdout = self._console_stream
+        sys.stderr = self._console_stream_err
         
         # Set window icon
         icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'assets', 'logo.png')
@@ -223,9 +297,11 @@ class MainWindow(QMainWindow):
         # Sparse baseline log interval - guarantees a scan always has log rows, even when
         # nothing significant is found, so "no weevils" is recorded rather than missing.
         self.log_interval_seconds = int(os.getenv('LOG_INTERVAL_SECONDS', '60'))
-        # Minimum gap between log rows triggered by a high weevil count
-        self.significant_log_interval_seconds = int(os.getenv('SIGNIFICANT_LOG_INTERVAL_SECONDS', '5'))
-        self.last_significant_log_time = None
+        # Minimum gap between log rows triggered by a frame containing weevils
+        self.detection_log_interval_seconds = int(os.getenv(
+            'DETECTION_LOG_INTERVAL_SECONDS',
+            os.getenv('SIGNIFICANT_LOG_INTERVAL_SECONDS', '5')))
+        self.last_detection_log_time = None
         # Tracks which DS18B20 conversion has already been added to the scan average
         self._last_temp_sample_id = None
         # Detection cycle interval - throttles YOLO inference on the Pi 5 CPU
@@ -326,15 +402,21 @@ class MainWindow(QMainWindow):
         self.tab_widget = QTabWidget()
         main_layout.addWidget(self.tab_widget)
         
-        # Create Live Feed tab
-        self.live_feed_tab = QWidget()
-        self.setup_live_feed_tab()
-        self.tab_widget.addTab(self.live_feed_tab, "Live Feed")
+        # Camera feed tabs. Both tabs share one instance of the Scan Controls,
+        # LED Controls, Current Detection and Detection Log panels, which are
+        # re-parented into whichever tab is active. Only the camera feed differs.
+        self.build_shared_panels()
+        self.left_feed_tab = self.create_feed_tab('left')
+        self.tab_widget.addTab(self.left_feed_tab, "Left Camera Feed")
+        self.right_feed_tab = self.create_feed_tab('right')
+        self.tab_widget.addTab(self.right_feed_tab, "Right Camera Feed")
+        self.tab_widget.currentChanged.connect(self.on_tab_changed)
+        self.attach_shared_panels('left')
         
         # Detection Logs tab - merges the old real-time Detection Information
         # table with the database-backed scan history. The per-scan detection log
         # and captured images are read back from SQLite, so a separate live table
-        # would only duplicate what the Live Feed log panel already shows.
+        # would only duplicate what the shared System Log panel already shows.
         self.scan_history_tab = QWidget()
         self.setup_scan_history_tab()
         self.tab_widget.addTab(self.scan_history_tab, "Detection Logs")
@@ -343,216 +425,251 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("Ready")
         self.statusBar().addWidget(self.status_label)
 
-    def setup_live_feed_tab(self):
+        # Route stdout/stderr print output into the System Log so the GUI
+        # shows the same text that appears in the terminal.
+        self._console_stream.line_printed.connect(self._on_console_line)
+        self._console_stream_err.line_printed.connect(self._on_console_line)
+
+    def _touch_button_style(self, background, hover, pressed=None, color="white", border="none"):
+        return f"""
+            QPushButton {{
+                background-color: {background};
+                color: {color};
+                font-size: 13px;
+                font-weight: bold;
+                border: {border};
+                border-radius: 6px;
+                padding: 6px;
+            }}
+            QPushButton:hover {{ background-color: {hover}; }}
+            QPushButton:pressed {{ background-color: {pressed or hover}; }}
+        """
+
+    def _make_touch_button(self, text, background, hover, handler,
+                           pressed=None, color="white", border="none"):
+        """Square, finger-sized button for the touchscreen."""
+        btn = QPushButton(text)
+        btn.setMinimumSize(self.TOUCH_BUTTON_SIZE, self.TOUCH_BUTTON_SIZE)
+        btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        btn.setStyleSheet(self._touch_button_style(background, hover, pressed, color, border))
+        btn.clicked.connect(handler)
+        return btn
+
+    def _make_zoom_button(self, text, handler):
+        """Small overlay button used by the per-camera digital zoom controls."""
+        btn = QPushButton(text)
+        btn.setFixedSize(self.ZOOM_BUTTON_SIZE, self.ZOOM_BUTTON_SIZE)
+        btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(69, 90, 100, 220); color: white;
+                font-size: 20px; font-weight: bold;
+                border-radius: 6px; padding: 1px;
+            }
+            QPushButton:hover { background-color: rgba(96, 125, 139, 240); }
+            QPushButton:pressed { background-color: rgba(55, 71, 79, 255); }
+        """)
+        btn.clicked.connect(handler)
+        return btn
+
+    def _make_touch_scrollable(self, widget):
+        """Make a QTableWidget/QListWidget scroll comfortably on the 7-inch
+        touchscreen by widening its scrollbars and giving the handles a tall,
+        finger-friendly minimum size. The styling is applied to the widget's
+        own viewport scrollbars so it composes cleanly with any per-widget
+        stylesheet already in place."""
+        size = self.TOUCH_SCROLLBAR_SIZE
+        style = f"""
+            QScrollBar:vertical {{
+                background: #f0f0f0;
+                width: {size}px;
+                margin: 0;
+            }}
+            QScrollBar::handle:vertical {{
+                background: #9e9e9e;
+                border-radius: {size // 2}px;
+                min-height: 40px;
+            }}
+            QScrollBar::handle:vertical:pressed {{ background: #616161; }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: none; }}
+            QScrollBar:horizontal {{
+                background: #f0f0f0;
+                height: {size}px;
+                margin: 0;
+            }}
+            QScrollBar::handle:horizontal {{
+                background: #9e9e9e;
+                border-radius: {size // 2}px;
+                min-width: 40px;
+            }}
+            QScrollBar::handle:horizontal:pressed {{ background: #616161; }}
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{ background: none; }}
+        """
+        # Merge with any stylesheet already set on the widget so we don't
+        # clobber table/list styling applied by the caller.
+        existing = widget.styleSheet()
+        widget.setStyleSheet(existing + style)
+
+    def _build_zoom_overlay(self, parent_label, side):
+        """Create a vertical zoom control panel overlaid inside a camera label
+        (+ on top, zoom label, - on bottom) pinned to the right edge."""
+        panel = QWidget(parent_label)
+        panel.setObjectName("zoomPanel")
+        panel.setStyleSheet("#zoomPanel { background-color: rgba(0, 0, 0, 110); border-radius: 8px; }")
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(4, 4, 4, 4)
+        panel_layout.setSpacing(4)
+        zoom_in = self._make_zoom_button("+", lambda: self.adjust_zoom(side, 1))
+        zoom_out = self._make_zoom_button("-", lambda: self.adjust_zoom(side, -1))
+        zoom_label = QLabel("1.0x")
+        zoom_label.setFont(QFont("Arial", 9, QFont.Bold))
+        zoom_label.setAlignment(Qt.AlignCenter)
+        zoom_label.setFixedSize(self.ZOOM_BUTTON_SIZE, 22)
+        zoom_label.setStyleSheet("color: white; background-color: rgba(0, 0, 0, 160); border-radius: 4px;")
+        panel_layout.addWidget(zoom_in)
+        panel_layout.addWidget(zoom_label)
+        panel_layout.addWidget(zoom_out)
+        # Fixed size keeps the placement maths correct before the panel is first shown.
+        panel.setFixedSize(self.ZOOM_BUTTON_SIZE + 8, self.ZOOM_BUTTON_SIZE * 2 + 22 + 16)
+        parent_label.zoom_panel = panel
+        parent_label.position_zoom_panel()
+        panel.show()
+        return panel, zoom_in, zoom_out, zoom_label
+
+    def create_feed_tab(self, side: str) -> QWidget:
+        """Build one camera feed tab. The tab only owns the camera view; the
+        Scan Controls, LED Controls, Current Detection and Detection Log panels
+        are the shared widgets attached by attach_shared_panels()."""
+        tab = QWidget()
         layout = QHBoxLayout()
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
-        self.live_feed_tab.setLayout(layout)
-        
-        # Left panel - Camera feeds (large) and controls below
+        tab.setLayout(layout)
+
         left_panel = QVBoxLayout()
         left_panel.setSpacing(6)
         layout.addLayout(left_panel, stretch=3)
-        
-        # Camera feeds container - larger
-        camera_container = QHBoxLayout()
-        camera_container.setSpacing(6)
-        left_panel.addLayout(camera_container, stretch=3)
 
-        # Per-camera zoom buttons (digital zoom on the displayed feed only).
-        # The buttons are overlaid inside each camera frame, vertically aligned
-        # (+ on top, zoom label, - on bottom) at the right edge.
-        def make_zoom_button(text, handler):
-            btn = QPushButton(text)
-            btn.setFixedSize(26, 26)
-            btn.setStyleSheet("""
-                QPushButton {
-                    background-color: rgba(69, 90, 100, 220); color: white;
-                    font-size: 14px; font-weight: bold;
-                    border-radius: 4px; padding: 1px;
-                }
-                QPushButton:hover { background-color: rgba(96, 125, 139, 240); }
-                QPushButton:pressed { background-color: rgba(55, 71, 79, 255); }
-            """)
-            btn.clicked.connect(handler)
-            return btn
+        # A single feed per tab, so the view gets the whole tab minus the shared
+        # controls strip and the fixed-width info column.
+        camera_label = CameraLabel()
+        camera_label.setMinimumSize(420, 280)
+        camera_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        camera_label.setStyleSheet("border: 2px solid #333; background-color: #000; border-radius: 5px;")
+        camera_label.setAlignment(Qt.AlignCenter)
+        camera_label.setText("No Signal")
+        left_panel.addWidget(camera_label, stretch=1)
 
-        def build_zoom_overlay(parent_label, side):
-            """Create a vertical zoom control panel overlaid inside a camera label."""
-            panel = QWidget(parent_label)
-            panel_layout = QVBoxLayout(panel)
-            panel_layout.setContentsMargins(0, 0, 0, 0)
-            panel_layout.setSpacing(2)
-            panel_layout.setAlignment(Qt.AlignCenter)
-            zoom_in = make_zoom_button("+", lambda: self.adjust_zoom(side, 1))
-            zoom_out = make_zoom_button("-", lambda: self.adjust_zoom(side, -1))
-            zoom_label = QLabel("1.0x")
-            zoom_label.setFont(QFont("Arial", 8, QFont.Bold))
-            zoom_label.setAlignment(Qt.AlignCenter)
-            zoom_label.setFixedWidth(26)
-            zoom_label.setStyleSheet("color: white; background-color: rgba(0, 0, 0, 150); border-radius: 3px;")
-            panel_layout.addWidget(zoom_in)
-            panel_layout.addWidget(zoom_label)
-            panel_layout.addWidget(zoom_out)
-            panel.adjustSize()
-            panel.show()
-            return panel, zoom_in, zoom_out, zoom_label
+        camera_title = QLabel(f"{side.capitalize()} Camera")
+        camera_title.setFont(QFont("Arial", 10, QFont.Bold))
+        camera_title.setStyleSheet("color: white; background-color: rgba(0, 0, 0, 150); padding: 3px; border-radius: 3px;")
+        camera_title.setAlignment(Qt.AlignCenter)
+        camera_title.setParent(camera_label)
+        camera_title.move(8, 8)
+        camera_title.show()
 
-        # --- Left camera + its zoom controls ---
-        self.left_camera_label = CameraLabel()
-        self.left_camera_label.setMinimumSize(200, 150)
-        self.left_camera_label.setSizePolicy(self.left_camera_label.sizePolicy().horizontalPolicy(), self.left_camera_label.sizePolicy().verticalPolicy())
-        self.left_camera_label.setStyleSheet("border: 2px solid #333; background-color: #000; border-radius: 5px;")
-        self.left_camera_label.setAlignment(Qt.AlignCenter)
-        self.left_camera_label.setText("No Signal")
-        camera_container.addWidget(self.left_camera_label, stretch=1)
+        panel, zoom_in, zoom_out, zoom_label = self._build_zoom_overlay(camera_label, side)
+        camera_label.zoom_panel = panel
+        setattr(self, f"{side}_camera_label", camera_label)
+        setattr(self, f"{side}_camera_title", camera_title)
+        setattr(self, f"{side}_zoom_panel", panel)
+        setattr(self, f"{side}_zoom_in_button", zoom_in)
+        setattr(self, f"{side}_zoom_out_button", zoom_out)
+        setattr(self, f"{side}_zoom_label", zoom_label)
 
-        left_camera_title = QLabel("Left Camera")
-        left_camera_title.setFont(QFont("Arial", 9, QFont.Bold))
-        left_camera_title.setStyleSheet("color: white; background-color: rgba(0, 0, 0, 150); padding: 3px; border-radius: 3px;")
-        left_camera_title.setAlignment(Qt.AlignCenter)
-        left_camera_title.setParent(self.left_camera_label)
-        left_camera_title.move(8, 8)
-        left_camera_title.show()
+        # Hosts for the shared panels: controls under the feed, info on the right
+        controls_host = QVBoxLayout()
+        controls_host.setSpacing(6)
+        left_panel.addLayout(controls_host, stretch=0)
 
-        left_panel_widgets = build_zoom_overlay(self.left_camera_label, 'left')
-        self.left_zoom_panel, self.left_zoom_in_button, self.left_zoom_out_button, self.left_zoom_label = left_panel_widgets
-        self.left_camera_label.zoom_panel = self.left_zoom_panel
+        info_host = QVBoxLayout()
+        info_host.setSpacing(6)
+        layout.addLayout(info_host, stretch=0)
 
-        # --- Right camera + its zoom controls ---
-        self.right_camera_label = CameraLabel()
-        self.right_camera_label.setMinimumSize(200, 150)
-        self.right_camera_label.setSizePolicy(self.right_camera_label.sizePolicy().horizontalPolicy(), self.right_camera_label.sizePolicy().verticalPolicy())
-        self.right_camera_label.setStyleSheet("border: 2px solid #333; background-color: #000; border-radius: 5px;")
-        self.right_camera_label.setAlignment(Qt.AlignCenter)
-        self.right_camera_label.setText("No Signal")
-        camera_container.addWidget(self.right_camera_label, stretch=1)
+        self.controls_hosts[side] = controls_host
+        self.info_hosts[side] = info_host
+        return tab
 
-        right_camera_title = QLabel("Right Camera")
-        right_camera_title.setFont(QFont("Arial", 9, QFont.Bold))
-        right_camera_title.setStyleSheet("color: white; background-color: rgba(0, 0, 0, 150); padding: 3px; border-radius: 3px;")
-        right_camera_title.setAlignment(Qt.AlignCenter)
-        right_camera_title.setParent(self.right_camera_label)
-        right_camera_title.move(8, 8)
-        right_camera_title.show()
+    def attach_shared_panels(self, side: str):
+        """Move the single shared controls/info panels into the given feed tab so
+        both tabs always show identical controls and detection state."""
+        previous = getattr(self, '_attached_side', None)
+        if previous == side:
+            return
+        if previous is not None:
+            self.controls_hosts[previous].removeWidget(self.shared_controls_widget)
+            self.info_hosts[previous].removeWidget(self.shared_info_widget)
+        self.controls_hosts[side].addWidget(self.shared_controls_widget)
+        self.info_hosts[side].addWidget(self.shared_info_widget)
+        self.shared_controls_widget.show()
+        self.shared_info_widget.show()
+        self._attached_side = side
 
-        right_panel_widgets = build_zoom_overlay(self.right_camera_label, 'right')
-        self.right_zoom_panel, self.right_zoom_in_button, self.right_zoom_out_button, self.right_zoom_label = right_panel_widgets
-        self.right_camera_label.zoom_panel = self.right_zoom_panel
-        
-        # Scan controls below camera feeds
+    def on_tab_changed(self, index: int):
+        widget = self.tab_widget.widget(index)
+        if widget is getattr(self, 'left_feed_tab', None):
+            self.attach_shared_panels('left')
+        elif widget is getattr(self, 'right_feed_tab', None):
+            self.attach_shared_panels('right')
+
+    def build_shared_panels(self):
+        self.controls_hosts = {}
+        self.info_hosts = {}
+        self._attached_side = None
+
+        # Scan and LED controls sit side by side in a single strip so the strip
+        # stays one row tall and the camera feed keeps the rest of the tab.
+        self.shared_controls_widget = QWidget()
+        controls_layout = QHBoxLayout()
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(6)
+        self.shared_controls_widget.setLayout(controls_layout)
+
+        self.shared_info_widget = QWidget()
+        self.shared_info_widget.setFixedWidth(self.INFO_PANEL_WIDTH)
+        info_layout = QVBoxLayout()
+        info_layout.setContentsMargins(0, 0, 0, 0)
+        info_layout.setSpacing(6)
+        self.shared_info_widget.setLayout(info_layout)
+
+        # Scan controls below the camera feed
         scan_group = QGroupBox("Scan Controls")
         scan_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 5px; margin-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
-        scan_layout = QVBoxLayout()
-        scan_layout.setSpacing(5)
+        # Side by side so the controls strip stays one row tall and the feed keeps
+        # the rest of the tab.
+        scan_layout = QHBoxLayout()
+        scan_layout.setSpacing(6)
         
-        self.start_button = QPushButton("Start Scan")
-        self.start_button.setMinimumHeight(34)
-        self.start_button.setStyleSheet("""
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                font-size: 12px;
-                font-weight: bold;
-                border-radius: 5px;
-                padding: 5px;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-            QPushButton:pressed {
-                background-color: #3d8b40;
-            }
-        """)
-        self.start_button.clicked.connect(self.toggle_scan)
+        self.start_button = self._make_touch_button(
+            "Start Scan", "#4CAF50", "#45a049", self.toggle_scan, pressed="#3d8b40")
         scan_layout.addWidget(self.start_button)
 
-        self.mixing_button = QPushButton("Mark as After Mixing/Sifting")
-        self.mixing_button.setMinimumHeight(30)
-        self.mixing_button.setStyleSheet("""
-            QPushButton {
-                background-color: #FF9800;
-                color: white;
-                font-size: 11px;
-                border-radius: 5px;
-                padding: 4px;
-            }
-            QPushButton:hover {
-                background-color: #F57C00;
-            }
-        """)
-        self.mixing_button.clicked.connect(self.toggle_mixing_state)
-        scan_layout.addWidget(self.mixing_button)
-
         scan_group.setLayout(scan_layout)
-        left_panel.addWidget(scan_group)
+        controls_layout.addWidget(scan_group, stretch=1)
         
-        # LED controls below scan controls
+        # LED controls beside the scan controls
         led_group = QGroupBox("LED Controls")
         led_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 5px; margin-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
         led_layout = QHBoxLayout()
         led_layout.setSpacing(6)
         
-        self.red_light_button = QPushButton("Red Light")
-        self.red_light_button.setMinimumHeight(28)
-        self.red_light_button.setStyleSheet("""
-            QPushButton {
-                background-color: #f44336;
-                color: white;
-                font-size: 11px;
-                border-radius: 5px;
-                padding: 4px;
-            }
-            QPushButton:hover {
-                background-color: #d32f2f;
-            }
-        """)
-        self.red_light_button.clicked.connect(self.set_red_light)
+        self.red_light_button = self._make_touch_button(
+            "Red Light", "#f44336", "#d32f2f", self.set_red_light, pressed="#b71c1c")
         led_layout.addWidget(self.red_light_button)
         
-        self.white_light_button = QPushButton("White Light")
-        self.white_light_button.setMinimumHeight(28)
-        self.white_light_button.setStyleSheet("""
-            QPushButton {
-                background-color: #ffffff;
-                color: black;
-                font-size: 11px;
-                border-radius: 5px;
-                border: 2px solid #333;
-                padding: 4px;
-            }
-            QPushButton:hover {
-                background-color: #e0e0e0;
-            }
-        """)
-        self.white_light_button.clicked.connect(self.set_white_light)
+        self.white_light_button = self._make_touch_button(
+            "White Light", "#ffffff", "#e0e0e0", self.set_white_light,
+            pressed="#cccccc", color="black", border="2px solid #333")
         led_layout.addWidget(self.white_light_button)
         
-        self.led_off_button = QPushButton("LEDs Off")
-        self.led_off_button.setMinimumHeight(28)
-        self.led_off_button.setStyleSheet("""
-            QPushButton {
-                background-color: #333;
-                color: white;
-                font-size: 11px;
-                border-radius: 5px;
-                padding: 4px;
-            }
-            QPushButton:hover {
-                background-color: #555;
-            }
-        """)
-        self.led_off_button.clicked.connect(self.set_leds_off)
+        self.led_off_button = self._make_touch_button(
+            "LEDs Off", "#333333", "#555555", self.set_leds_off, pressed="#111111")
         led_layout.addWidget(self.led_off_button)
         
         led_group.setLayout(led_layout)
-        left_panel.addWidget(led_group)
+        controls_layout.addWidget(led_group, stretch=3)
         
-        # Right panel - Current detection info and detection log
-        right_panel = QVBoxLayout()
-        right_panel.setSpacing(6)
-        layout.addLayout(right_panel, stretch=1)
-
         # Current detection info
         current_info_group = QGroupBox("Current Detection")
         current_info_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 5px; margin-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
@@ -560,11 +677,13 @@ class MainWindow(QMainWindow):
         current_info_layout.setSpacing(4)
         current_info_layout.setContentsMargins(8, 8, 8, 8)
         
-        self.count_label = QLabel("Weevil Count: 0")
+        self.count_label = QLabel("Weevil Count: --")
         self.count_label.setFont(QFont("Arial", 11, QFont.Bold))
         self.count_label.setStyleSheet("padding: 5px; background-color: #e8f5e9; border-radius: 5px; border: 1px solid #c8e6c9;")
         current_info_layout.addWidget(self.count_label)
         
+        # Confidence and count are only meaningful during an active scan; show
+        # "--" before the first detection and after the scan stops.
         self.confidence_label = QLabel("Avg Confidence: --")
         self.confidence_label.setFont(QFont("Arial", 9))
         self.confidence_label.setStyleSheet("padding: 5px; background-color: #e8f5e9; border-radius: 5px; border: 1px solid #c8e6c9;")
@@ -583,46 +702,32 @@ class MainWindow(QMainWindow):
         current_info_layout.addWidget(self.recommendation_label)
 
         current_info_group.setLayout(current_info_layout)
-        right_panel.addWidget(current_info_group)
+        info_layout.addWidget(current_info_group)
         
-        # YOLOv11n model and inference performance
+        # Detection model runtime performance - inference time and detection rate only.
+        # The static model/backend details are logged at startup instead of taking up
+        # room in the narrow side panel.
         model_group = QGroupBox("Detection Model")
         model_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 5px; margin-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
         model_layout = QVBoxLayout()
         model_layout.setSpacing(4)
         model_layout.setContentsMargins(8, 8, 8, 8)
         
-        self.model_label = QLabel("Model: loading...")
-        self.model_label.setFont(QFont("Arial", 9, QFont.Bold))
-        self.model_label.setWordWrap(True)
-        self.model_label.setStyleSheet("padding: 4px; background-color: #ede7f6; border-radius: 5px; border: 1px solid #d1c4e9;")
-        model_layout.addWidget(self.model_label)
+        self.inference_label = QLabel("Inference: -- ms")
+        self.inference_label.setFont(QFont("Consolas", 9))
+        self.inference_label.setStyleSheet("padding: 5px; background-color: #fff8e1; border-radius: 5px; border: 1px solid #ffecb3;")
+        model_layout.addWidget(self.inference_label)
         
-        self.model_detail_label = QLabel("Backend: --")
-        self.model_detail_label.setFont(QFont("Arial", 8))
-        self.model_detail_label.setWordWrap(True)
-        self.model_detail_label.setMinimumWidth(0)
-        self.model_detail_label.setStyleSheet("padding: 4px; background-color: #f3e5f5; border-radius: 5px; border: 1px solid #e1bee7; color: #444;")
-        model_layout.addWidget(self.model_detail_label)
-        
-        self.performance_label = QLabel("Inference: -- ms   |   Rate: -- /s")
-        self.performance_label.setFont(QFont("Consolas", 8))
-        self.performance_label.setStyleSheet("padding: 4px; background-color: #fff8e1; border-radius: 5px; border: 1px solid #ffecb3;")
-        model_layout.addWidget(self.performance_label)
-        
-        self.model_warning_label = QLabel()
-        self.model_warning_label.setFont(QFont("Arial", 8, QFont.Bold))
-        self.model_warning_label.setWordWrap(True)
-        self.model_warning_label.setMinimumWidth(0)
-        self.model_warning_label.setStyleSheet("padding: 4px; background-color: #ffebee; border-radius: 5px; border: 1px solid #ef9a9a; color: #b71c1c;")
-        self.model_warning_label.setVisible(False)
-        model_layout.addWidget(self.model_warning_label)
+        self.rate_label = QLabel("Rate: -- /s")
+        self.rate_label.setFont(QFont("Consolas", 9))
+        self.rate_label.setStyleSheet("padding: 5px; background-color: #fff8e1; border-radius: 5px; border: 1px solid #ffecb3;")
+        model_layout.addWidget(self.rate_label)
         
         model_group.setLayout(model_layout)
-        right_panel.addWidget(model_group)
+        info_layout.addWidget(model_group)
         
-        # Detection log display - compact
-        log_group = QGroupBox("Detection Log")
+        # System log display - compact
+        log_group = QGroupBox("System Log")
         log_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 5px; margin-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
         log_layout = QVBoxLayout()
         log_layout.setContentsMargins(4, 4, 4, 4)
@@ -633,7 +738,7 @@ class MainWindow(QMainWindow):
         log_layout.addWidget(self.log_text)
         
         log_group.setLayout(log_layout)
-        right_panel.addWidget(log_group)
+        info_layout.addWidget(log_group, stretch=1)
 
     def setup_scan_history_tab(self):
         layout = QVBoxLayout()
@@ -641,24 +746,64 @@ class MainWindow(QMainWindow):
         layout.setSpacing(6)
         self.scan_history_tab.setLayout(layout)
 
-        table_style = """
-            QTableWidget {
+        # Touch-friendly styling: tall rows, generous padding and a clearly
+        # highlighted selection so a finger tap is easy to aim and easy to confirm.
+        table_style = f"""
+            QTableWidget {{
                 border: 1px solid #ddd;
                 border-radius: 3px;
                 background-color: white;
                 gridline-color: #eee;
-            }
-            QTableWidget::item { padding: 3px; border-bottom: 1px solid #eee; }
-            QHeaderView::section {
+                font-size: 12px;
+            }}
+            QTableWidget::item {{
+                padding: 10px 8px;
+                border-bottom: 1px solid #eee;
+            }}
+            QTableWidget::item:selected {{
+                background-color: #1976D2;
+                color: white;
+            }}
+            QHeaderView::section {{
                 background-color: #f5f5f5;
-                padding: 5px;
+                padding: 10px 6px;
                 border: 1px solid #ddd;
                 font-weight: bold;
+                font-size: 12px;
                 color: #333;
-            }
+            }}
+            QScrollBar:vertical {{
+                background: #f0f0f0;
+                width: {self.TOUCH_SCROLLBAR_SIZE}px;
+                margin: 0;
+            }}
+            QScrollBar::handle:vertical {{
+                background: #9e9e9e;
+                border-radius: {self.TOUCH_SCROLLBAR_SIZE // 2}px;
+                min-height: 40px;
+            }}
+            QScrollBar::handle:vertical:pressed {{ background: #616161; }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+            QScrollBar:horizontal {{
+                background: #f0f0f0;
+                height: {self.TOUCH_SCROLLBAR_SIZE}px;
+                margin: 0;
+            }}
+            QScrollBar::handle:horizontal {{
+                background: #9e9e9e;
+                border-radius: {self.TOUCH_SCROLLBAR_SIZE // 2}px;
+                min-width: 40px;
+            }}
+            QScrollBar::handle:horizontal:pressed {{ background: #616161; }}
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
         """
 
         splitter = QSplitter(Qt.Horizontal)
+        # A thin desktop splitter handle is impossible to grab with a fingertip.
+        splitter.setHandleWidth(12)
+        splitter.setStyleSheet(
+            "QSplitter::handle { background-color: #cfd8dc; border-radius: 4px; } "
+            "QSplitter::handle:pressed { background-color: #90a4ae; }")
         layout.addWidget(splitter, stretch=1)
         
         # Left: stored scans
@@ -676,6 +821,11 @@ class MainWindow(QMainWindow):
         self.scan_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.scan_table.setSelectionMode(QTableWidget.SingleSelection)
         self.scan_table.setStyleSheet(table_style)
+        self._make_touch_scrollable(self.scan_table)
+        # Tall rows and no row numbers: the vertical header is dead space on a
+        # touchscreen and the scan id already identifies the row.
+        self.scan_table.verticalHeader().setDefaultSectionSize(self.TOUCH_ROW_HEIGHT)
+        self.scan_table.verticalHeader().setVisible(False)
         self.scan_table.itemSelectionChanged.connect(self.on_scan_selected)
         scans_layout.addWidget(self.scan_table)
         
@@ -690,28 +840,62 @@ class MainWindow(QMainWindow):
         detail_layout.setSpacing(5)
         
         self.image_preview_label = QLabel("Select a scan to preview its stored images")
-        self.image_preview_label.setMinimumHeight(120)
+        self.image_preview_label.setMinimumHeight(140)
         self.image_preview_label.setAlignment(Qt.AlignCenter)
-        self.image_preview_label.setStyleSheet("border: 2px solid #333; background-color: #000; color: #999; border-radius: 5px;")
+        self.image_preview_label.setStyleSheet("border: 2px solid #333; background-color: #000; color: #999; border-radius: 5px; font-size: 12px;")
         detail_layout.addWidget(self.image_preview_label, stretch=2)
         
         self.image_list = QListWidget()
-        self.image_list.setMaximumHeight(80)
-        self.image_list.setStyleSheet("font-family: Consolas, monospace; font-size: 9px; border: 1px solid #ddd; border-radius: 3px;")
+        # Two finger-sized rows are visible at a time; the rest is scrolled.
+        self.image_list.setFixedHeight(self.TOUCH_ROW_HEIGHT * 2 + 8)
+        self.image_list.setStyleSheet(f"""
+            QListWidget {{
+                font-family: Consolas, monospace;
+                font-size: 11px;
+                border: 1px solid #ddd;
+                border-radius: 3px;
+            }}
+            QListWidget::item {{
+                min-height: {self.TOUCH_ROW_HEIGHT}px;
+                padding: 4px 8px;
+                border-bottom: 1px solid #eee;
+            }}
+            QListWidget::item:selected {{ background-color: #1976D2; color: white; }}
+            QScrollBar:vertical {{
+                background: #f0f0f0;
+                width: {self.TOUCH_SCROLLBAR_SIZE}px;
+                margin: 0;
+            }}
+            QScrollBar::handle:vertical {{
+                background: #9e9e9e;
+                border-radius: {self.TOUCH_SCROLLBAR_SIZE // 2}px;
+                min-height: 40px;
+            }}
+            QScrollBar::handle:vertical:pressed {{ background: #616161; }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+        """)
+        self._make_touch_scrollable(self.image_list)
         self.image_list.currentRowChanged.connect(self.on_history_image_selected)
-        detail_layout.addWidget(self.image_list, stretch=1)
+        detail_layout.addWidget(self.image_list, stretch=0)
         
         self.history_log_table = QTableWidget()
         self.history_log_table.setColumnCount(4)
         self.history_log_table.setHorizontalHeaderLabels(["Timestamp", "Count", "Temp", "Recommendation"])
         self.history_log_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.history_log_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.history_log_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.history_log_table.setStyleSheet(table_style)
+        self._make_touch_scrollable(self.history_log_table)
+        self.history_log_table.verticalHeader().setDefaultSectionSize(self.TOUCH_ROW_HEIGHT)
+        self.history_log_table.verticalHeader().setVisible(False)
         detail_layout.addWidget(self.history_log_table, stretch=2)
         
         detail_group.setLayout(detail_layout)
         splitter.addWidget(detail_group)
         splitter.setSizes([520, 420])
+        # Neither pane may be collapsed to zero by a stray drag, which on a
+        # touchscreen would be very easy to do and hard to undo.
+        splitter.setChildrenCollapsible(False)
         
         # Actions - the merged tab keeps Refresh, Email Selected Scan Report and
         # Open Scans Folder. The manual "Export Zip from Database" button was removed
@@ -721,17 +905,19 @@ class MainWindow(QMainWindow):
         
         def make_button(text, color, hover, handler):
             button = QPushButton(text)
-            button.setMinimumHeight(30)
+            button.setMinimumHeight(self.TOUCH_BUTTON_SIZE)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             button.setStyleSheet(f"""
                 QPushButton {{
                     background-color: {color};
                     color: white;
-                    font-size: 11px;
+                    font-size: 13px;
                     font-weight: bold;
-                    border-radius: 5px;
-                    padding: 5px;
+                    border-radius: 6px;
+                    padding: 6px;
                 }}
                 QPushButton:hover {{ background-color: {hover}; }}
+                QPushButton:pressed {{ background-color: {hover}; }}
                 QPushButton:disabled {{ background-color: #bdbdbd; }}
             """)
             button.clicked.connect(handler)
@@ -739,6 +925,8 @@ class MainWindow(QMainWindow):
             return button
         
         self.refresh_history_button = make_button("Refresh", "#2196F3", "#1976D2", self.refresh_scan_history)
+        self.delete_scan_button = make_button("Delete Selected Scan", "#E53935", "#C62828",
+                                              self.delete_selected_scan)
         self.open_scans_folder_button = make_button("Open Scans Folder", "#607D8B", "#455A64",
                                                    self.view_previous_scans)
         layout.addLayout(button_row)
@@ -787,39 +975,34 @@ class MainWindow(QMainWindow):
         self.refresh_scan_history()
 
     def update_model_display(self):
-        """Show which YOLOv11n weights and backend are actually loaded."""
+        """Report which YOLOv11n weights and backend are loaded to the Detection Log.
+
+        The Detection Model panel itself only shows the live Inference and Rate
+        figures, so the static details go to the log instead of the side panel.
+        """
         info = self.detector.get_model_info()
         status = "loaded" if info['initialized'] else "NOT LOADED"
-        self.model_label.setText(f"{info['architecture']} - {info['model_name']} ({status})")
         classes = ', '.join(str(c) for c in info['classes']) or 'none'
         metrics = info['metrics']
-        self.model_detail_label.setText(
+        self.log_message(
+            f"Model: {info['architecture']} - {info['model_name']} ({status})   |   "
             f"Backend: {info['backend']}   |   Device: {info['device']}   |   "
-            f"Input: {info['imgsz']}px (trained {info['trained_imgsz']}px)\n"
-            f"Classes: {classes}\n"
-            f"Confidence >= {info['confidence_threshold']}   |   IoU {info['iou_threshold']}   |   "
-            f"Cycle every {self.detection_interval_ms} ms\n"
+            f"Input: {info['imgsz']}px (trained {info['trained_imgsz']}px)   |   "
+            f"Classes: {classes}   |   Confidence >= {info['confidence_threshold']}   |   "
+            f"IoU {info['iou_threshold']}   |   Cycle every {self.detection_interval_ms} ms   |   "
             f"Training ({metrics['run']}, {metrics['epochs']} epochs): "
-            f"mAP50 {metrics['mAP50']:.3f}   mAP50-95 {metrics['mAP50-95']:.3f}   "
-            f"P {metrics['precision']:.3f}   R {metrics['recall']:.3f}")
+            f"mAP50 {metrics['mAP50']:.3f}, mAP50-95 {metrics['mAP50-95']:.3f}, "
+            f"P {metrics['precision']:.3f}, R {metrics['recall']:.3f}")
         
         warning = info['warning']
         if not info['initialized']:
             warning = warning or "Model failed to load - no detections will be recorded."
-        # Break long unbreakable tokens (e.g. the re-export command) so the label
-        # can wrap inside the narrow right panel instead of forcing the window wide.
         if warning:
-            warning = (warning
-                       .replace(").export(", ")\n.export(")
-                       .replace("YOLO('", "YOLO(\n'"))
-        self.model_warning_label.setText(warning or "")
-        self.model_warning_label.setVisible(bool(warning))
-        if warning:
-            self.log_message(f"MODEL WARNING: {info['warning']}")
+            self.log_message(f"MODEL WARNING: {warning}")
 
     def update_performance_stats(self, rate_per_second: float, avg_inference_ms: float):
-        self.performance_label.setText(
-            f"Inference: {avg_inference_ms:6.1f} ms   |   Rate: {rate_per_second:5.1f} /s")
+        self.inference_label.setText(f"Inference: {avg_inference_ms:6.1f} ms")
+        self.rate_label.setText(f"Rate: {rate_per_second:5.1f} /s")
 
     def toggle_scan(self):
         if self.is_scanning:
@@ -829,8 +1012,39 @@ class MainWindow(QMainWindow):
 
     def start_scan(self):
         if not self.camera_manager.start():
-            self.log_message("Failed to start cameras")
+            self.log_message("Failed to start cameras - no capture device could be opened")
             return
+
+        # Opening a device proves nothing on Windows: a virtual camera opens fine and
+        # returns blank or frozen frames.  Wait for the capture loop to confirm a real
+        # moving picture before the model is allowed anywhere near these feeds.
+        left_ok, right_ok = self.camera_manager.wait_for_signal(timeout=3.0)
+
+        if not left_ok:
+            self.log_message(f"Left camera has no live signal - "
+                             f"{self.camera_manager.left_camera.get_signal_reason()}")
+        if not right_ok:
+            self.log_message(f"Right camera has no live signal - "
+                             f"{self.camera_manager.right_camera.get_signal_reason()}")
+
+        if not left_ok and not right_ok:
+            self.log_message("Scan cancelled - neither camera is producing a live picture")
+            self.camera_manager.stop()
+            self.update_camera_status(False, False)
+            QMessageBox.warning(
+                self, "No Camera Signal",
+                "Neither camera is producing a live picture, so the scan was not started.\n\n"
+                "Check that the cameras are plugged in and not in use by another "
+                "application. If a camera is not installed, set its ID to -1 in "
+                "config.env so the system stops looking for it.")
+            return
+
+        if left_ok and right_ok:
+            self.log_message("Both cameras have a live signal")
+        else:
+            self.log_message(f"Scanning with the "
+                             f"{'left' if left_ok else 'right'} camera only")
+        self.update_camera_status(left_ok, right_ok)
         
         # Create scan folder with timestamp
         # Scan ID format: scan_YYYY-MM-DD_HH-MM-SS (readable, sortable, Year-Month-Date order)
@@ -888,28 +1102,19 @@ class MainWindow(QMainWindow):
         self.detection_thread.frame_ready_right.connect(self.update_right_frame)
         self.detection_thread.detection_update.connect(self.update_detection)
         self.detection_thread.stats_update.connect(self.update_performance_stats)
+        self.detection_thread.camera_status.connect(self.update_camera_status)
         self.detection_thread.start()
         
         # Reset image/log tracking so the previous scan's timings do not leak in
         self.last_image_capture_time = None
         self.last_log_time = None
-        self.last_significant_log_time = None
+        self.last_detection_log_time = None
         self._last_temp_sample_id = None
         
         self.is_scanning = True
         self.start_button.setText("Stop Scan")
-        self.start_button.setStyleSheet("""
-            QPushButton {
-                background-color: #f44336;
-                color: white;
-                font-size: 16px;
-                font-weight: bold;
-                border-radius: 5px;
-            }
-            QPushButton:hover {
-                background-color: #d32f2f;
-            }
-        """)
+        self.start_button.setStyleSheet(
+            self._touch_button_style("#f44336", "#d32f2f", pressed="#b71c1c"))
         # Start the fixed-duration scan protocol
         self.scan_timer.start(self.scan_duration_seconds * 1000)
         self.scan_countdown_timer.start(1000)
@@ -962,19 +1167,20 @@ class MainWindow(QMainWindow):
         
         self.is_scanning = False
         self.start_button.setText("Start Scan")
-        self.start_button.setStyleSheet("""
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                font-size: 16px;
-                font-weight: bold;
-                border-radius: 5px;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-        """)
+        self.start_button.setStyleSheet(
+            self._touch_button_style("#4CAF50", "#45a049", pressed="#3d8b40"))
+        # Reset the detection display so stale counts do not linger after the scan stops.
+        self.count_label.setText("Weevil Count: --")
+        self.confidence_label.setText("Avg Confidence: --")
+        self.recommendation_label.setText("Recommendation: --")
         self.status_label.setText("Ready")
+        # Reset camera labels to "No Signal" since the feeds are now stopped.
+        self.left_camera_label.setText("No Signal")
+        self.left_camera_label.setPixmap(QPixmap())
+        self.right_camera_label.setText("No Signal")
+        self.right_camera_label.setPixmap(QPixmap())
+        self.latest_annotated_left = None
+        self.latest_annotated_right = None
         self.log_message("Scan stopped and saved")
         
         if scan_id:
@@ -1145,6 +1351,93 @@ class MainWindow(QMainWindow):
         self.image_preview_label.setPixmap(
             pixmap.scaled(self.image_preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
+    def delete_selected_scan(self):
+        """Delete the selected stored scan from the database and disk.
+
+        Removing the scan row also removes its detections, stored images and report
+        records, so the Stored Detection Log and Images pane is cleared and reloaded
+        to stay consistent with what is actually stored.
+        """
+        scan_id = self.selected_scan_id()
+        if not scan_id:
+            QMessageBox.information(self, "Delete Scan", "Select a stored scan first.")
+            return
+        if self.is_scanning and scan_id == self.current_scan_id:
+            QMessageBox.warning(self, "Delete Scan",
+                                "Stop the running scan before deleting it.")
+            return
+        
+        confirm = QMessageBox.question(
+            self, "Delete Scan",
+            f"Delete {scan_id}?\n\nIts detection log, stored images, recordings and "
+            f"report archive are removed permanently.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if confirm != QMessageBox.Yes:
+            return
+        
+        # Capture what is about to be lost so the notification email can describe it
+        try:
+            scan = self.db.get_scan_by_id(scan_id) or {}
+            detection_count = len(self.db.get_detections_by_scan(scan_id))
+            image_count = self.db.get_scan_image_count(scan_id)
+        except Exception as e:
+            self.log_message(f"Could not read {scan_id} before deleting: {e}")
+            scan, detection_count, image_count = {}, 0, 0
+        
+        try:
+            deleted = self.db.delete_scan(scan_id)
+        except Exception as e:
+            self.log_message(f"Error deleting {scan_id} from the database: {e}")
+            QMessageBox.critical(self, "Delete Scan", f"Could not delete {scan_id}:\n{e}")
+            return
+        
+        # Keep the file system in step with the database
+        for path in (os.path.join(self.previous_scans_dir, scan_id),
+                     os.path.join(self.reports_dir, f"{scan_id}_report.zip")):
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                elif os.path.isfile(path):
+                    os.remove(path)
+            except OSError as e:
+                self.log_message(f"Could not remove {path}: {e}")
+        
+        self.log_message(f"Deleted scan {scan_id}" if deleted
+                         else f"Scan {scan_id} was not found in the database")
+        
+        if deleted:
+            avg_temp = scan.get('avg_temperature_celsius')
+            temp_str = f"{avg_temp:.1f} C" if isinstance(avg_temp, (int, float)) else "N/A"
+            subject = f"Anilag Scan Deleted - {scan_id}"
+            body = (
+                f"Anilag Rice Weevil Detection System\n"
+                f"====================================\n\n"
+                f"A stored scan was deleted by the user from the Detection Logs tab.\n\n"
+                f"Scan ID: {scan_id}\n"
+                f"Deletion timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"Scan start time: {scan.get('start_time', 'unknown')}\n"
+                f"Scan end time: {scan.get('end_time', 'unknown')}\n"
+                f"Max weevil count: {scan.get('max_weevil_count', 'unknown')}\n"
+                f"Average temperature: {temp_str}\n"
+                f"Detection log entries removed: {detection_count}\n"
+                f"Stored images removed: {image_count}\n\n"
+                f"The scan recordings and report archive were removed from storage as well. "
+                f"This deletion is permanent.\n\n"
+                f"This is an automated notification from the Anilag detection system.")
+            # Send directly via send_email so the notification is not gated by the
+            # EMAIL_ACTIVITY_ALERTS opt-in (which defaults to false).  Scan deletion is
+            # an important data-loss event that the admin should always be told about.
+            self.send_email_async(f"Scan Deleted {scan_id}",
+                                  self.email_notifier.send_email, subject, body)
+        
+        # Clear the detail pane; refresh_scan_history re-selects a remaining scan
+        # (or leaves the pane empty when none are left).
+        self.image_list.clear()
+        self.history_log_table.setRowCount(0)
+        self.image_preview_label.setPixmap(QPixmap())
+        self.image_preview_label.setText("Select a scan to preview its stored images")
+        self.refresh_scan_history()
+
     def view_previous_scans(self):
         # Open the previous scans folder in the system file explorer
         import subprocess
@@ -1246,36 +1539,6 @@ class MainWindow(QMainWindow):
         self.send_email_async("LED Control", self.email_notifier.send_activity_log,
                               "LED Control", "White light activated for detection")
 
-    def toggle_mixing_state(self):
-        self.is_after_mixing = not self.is_after_mixing
-        if self.is_after_mixing:
-            self.mixing_button.setText("After Mixing: ON")
-            self.mixing_button.setStyleSheet("""
-                QPushButton {
-                    background-color: #4CAF50;
-                    color: white;
-                    font-size: 13px;
-                    border-radius: 5px;
-                    padding: 6px;
-                }
-            """)
-            self.log_message("Marked as after mixing/sifting")
-        else:
-            self.mixing_button.setText("Mark as After Mixing/Sifting")
-            self.mixing_button.setStyleSheet("""
-                QPushButton {
-                    background-color: #FF9800;
-                    color: white;
-                    font-size: 13px;
-                    border-radius: 5px;
-                    padding: 6px;
-                }
-                QPushButton:hover {
-                    background-color: #F57C00;
-                }
-            """)
-            self.log_message("Marked as before mixing/sifting")
-
     def set_leds_off(self):
         applied = self.led_controller.off()
         suffix = "" if applied else " (simulated - no LED hardware)"
@@ -1351,11 +1614,25 @@ class MainWindow(QMainWindow):
         # Display with current zoom level (display-only; recording keeps full frame)
         self._render_frame_to_label(annotated_frame, self.right_camera_label, self.right_zoom)
 
+    def update_camera_status(self, left_live: bool, right_live: bool):
+        """Blank a feed that has no live signal so no stale picture (and no stale
+        bounding boxes) is left on screen for a camera that is not delivering."""
+        for live, label, side in ((left_live, self.left_camera_label, 'left'),
+                                  (right_live, self.right_camera_label, 'right')):
+            if live:
+                continue
+            label.setPixmap(QPixmap())
+            label.setText("No Signal")
+            setattr(self, f"latest_annotated_{side}", None)
+
     def update_detection(self, count: int, confidence: float, activity: str):
-        # Update count label (always update real-time)
-        self.count_label.setText(f"Weevil Count: {count}")
-        self.confidence_label.setText(
-            f"Avg Confidence: {confidence * 100:.1f}%" if confidence else "Avg Confidence: --")
+        # Only show count/confidence during an active scan with cameras running.
+        # Before the scan starts or after it stops, the labels stay at "--" so the
+        # UI does not display a phantom count from a non-existent camera feed.
+        if self.is_scanning:
+            self.count_label.setText(f"Weevil Count: {count}")
+            self.confidence_label.setText(
+                f"Avg Confidence: {confidence * 100:.1f}%" if confidence else "Avg Confidence: --")
         
         # Get temperature (cached; the DS18B20 is polled in its own thread)
         sample_id, temperature = self.temp_sensor.read_sample()
@@ -1375,20 +1652,25 @@ class MainWindow(QMainWindow):
         # "Significant" means a noticeably high reading, not merely a non-zero one.
         is_significant = count >= self.high_weevil_threshold
         
-        # Images are only captured for significant counts, rate-limited by the cooldown.
-        should_capture = (self.is_scanning and is_significant and
+        # Capture images for any non-zero count, rate-limited by the cooldown.  Previously
+        # this only fired for high counts (>= HIGH_WEEVIL_THRESHOLD), so a scan that saw
+        # 1-4 weevils stored zero images and the zip archive had an empty detected_images/
+        # folder.  High-count frames are still prioritised by the log marker below.
+        should_capture = (self.is_scanning and count > 0 and
                          (self.last_image_capture_time is None or
                           (current_time - self.last_image_capture_time).total_seconds() >= self.image_capture_cooldown))
         
-        # Log every significant reading (rate-limited so a sustained high count does not
-        # flood the table), plus a sparse baseline row so quiet scans still record that
-        # the equipment was running and found little or nothing.
-        should_log_significant = is_significant and (
-            self.last_significant_log_time is None or
-            (current_time - self.last_significant_log_time).total_seconds() >= self.significant_log_interval_seconds)
+        # Log every reading that contains weevils, not just high counts - otherwise a
+        # scan that only ever sees 1-4 weevils stores nothing but the sparse baseline
+        # rows and the stored detection log looks empty. Rate-limited so a sustained
+        # detection does not flood the table. The baseline row still guarantees quiet
+        # scans record that the equipment was running and found nothing.
+        should_log_detection = count > 0 and (
+            self.last_detection_log_time is None or
+            (current_time - self.last_detection_log_time).total_seconds() >= self.detection_log_interval_seconds)
         should_log_baseline = (self.last_log_time is None or
                                current_time - self.last_log_time >= timedelta(seconds=self.log_interval_seconds))
-        should_log = should_log_significant or should_log_baseline
+        should_log = should_log_detection or should_log_baseline
         
         # Always log to the CSV file (for data integrity)
         log_entry = self.logger.log_detection(count, temperature, self.is_after_mixing, activity)
@@ -1418,12 +1700,12 @@ class MainWindow(QMainWindow):
         
         if should_log:
             temp_str = f"{temperature:.1f}°C" if temperature is not None else "N/A"
-            marker = "HIGH COUNT " if should_log_significant else ""
+            marker = "HIGH COUNT " if is_significant else ""
             self.log_message(f"{marker}{log_entry.timestamp} - Count: {count}, Temp: {temp_str}, "
                              f"Rec: {log_entry.recommendation}")
             self.last_log_time = current_time
-            if should_log_significant:
-                self.last_significant_log_time = current_time
+            if should_log_detection:
+                self.last_detection_log_time = current_time
     
     def capture_detection_images(self, count: int, confidence: float = 0.0,
                                 detection_id: Optional[int] = None) -> list:
@@ -1437,8 +1719,7 @@ class MainWindow(QMainWindow):
         
         timestamp = datetime.now()
         stamp = timestamp.strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        # Images are only captured for significant counts, so they are all high-count frames.
-        prefix = "high_weevil"
+        prefix = "high_weevil" if count >= self.high_weevil_threshold else "weevil"
         quality = int(os.getenv('IMAGE_JPEG_QUALITY', '85'))
         saved = []
         
@@ -1478,8 +1759,12 @@ class MainWindow(QMainWindow):
                 self.log_message(f"Error storing image in database: {e}")
         
         if saved:
-            self.log_message(f"High weevil count ({count} >= {self.high_weevil_threshold}) - "
-                             f"stored {len(saved)} image(s) in database")
+            if count >= self.high_weevil_threshold:
+                self.log_message(f"High weevil count ({count} >= {self.high_weevil_threshold}) - "
+                                 f"stored {len(saved)} image(s) in database")
+            else:
+                self.log_message(f"Weevil count {count} - "
+                                 f"stored {len(saved)} image(s) in database")
         return saved
 
     def update_temperature(self):
@@ -1522,6 +1807,12 @@ class MainWindow(QMainWindow):
         scrollbar = self.log_text.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
+    def _on_console_line(self, line: str):
+        """Slot for ConsoleLogStream.line_printed — mirrors terminal output."""
+        self.log_text.append(line)
+        scrollbar = self.log_text.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
     def closeEvent(self, event):
         if self.is_scanning:
             self.stop_scan()
@@ -1530,6 +1821,9 @@ class MainWindow(QMainWindow):
             thread.wait(90000)
         self.led_controller.cleanup()
         self.temp_sensor.cleanup()
+        # Restore original stdout/stderr so post-shutdown messages go to the real terminal
+        sys.stdout = self._console_stream._original
+        sys.stderr = self._console_stream_err._original
         event.accept()
 
 

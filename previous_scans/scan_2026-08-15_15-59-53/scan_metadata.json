@@ -1,15 +1,15 @@
 {
-    "scan_id": "scan_2026-08-12_16-29-16",
-    "scan_start_time": "2026-08-12 16:29:16",
-    "scan_end_time": "2026-08-12 16:29:28",
-    "duration_seconds": 12,
+    "scan_id": "scan_2026-08-15_15-59-53",
+    "scan_start_time": "2026-08-15 15:59:53",
+    "scan_end_time": "2026-08-15 17:32:37",
+    "duration_seconds": 5564,
     "protocol_duration_seconds": 180,
-    "max_weevil_count": 0,
+    "max_weevil_count": 2,
     "average_temperature_celsius": 0.0,
     "temperature_readings_count": 0,
-    "log_entry_count": 1,
-    "image_count": 0,
-    "recommendation": "No Action Needed",
+    "log_entry_count": 5,
+    "image_count": 2,
+    "recommendation": "Mix and Sift Rice",
     "after_mixing": false,
     "model": {
         "name": "sitophilus_oryzae_v2-3_best.pt",
@@ -21,7 +21,7 @@
             "Sitophilus Oryzae"
         ]
     },
-    "avg_inference_ms": 61.3,
+    "avg_inference_ms": 67348.0,
     "temperature_sensor": {
         "device_id": "",
         "available": false,
