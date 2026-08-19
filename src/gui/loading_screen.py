@@ -4,8 +4,8 @@ Displays logo during 5-second startup with smooth animations
 """
 
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QLabel, QProgressBar, QGraphicsDropShadowEffect
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QPixmap, QFont, QColor
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QRect
+from PyQt5.QtGui import QPixmap, QFont, QColor, QImage
 import os
 import sys
 
@@ -55,7 +55,46 @@ class LoadingScreen(QWidget):
                 return normalized
         
         return None
-    
+
+    def _crop_to_content(self, pixmap: QPixmap) -> QPixmap:
+        """Crop transparent padding around the logo so only the artwork shows.
+
+        Scans the pixmap's alpha channel for the bounding box of visible
+        pixels and returns a cropped copy. A threshold is used (alpha > 10)
+        so that stray near-invisible noise pixels (alpha = 1) at the edges of
+        the source image do not extend the crop and make the logo appear
+        off-center. If the pixmap has no alpha or is fully transparent, the
+        original is returned unchanged.
+        """
+        if pixmap.isNull():
+            return pixmap
+        image = pixmap.toImage()
+        if image.isNull() or not image.hasAlphaChannel():
+            return pixmap
+        width = image.width()
+        height = image.height()
+        min_x, min_y = width, height
+        max_x, max_y = -1, -1
+        # Threshold ignores near-transparent noise pixels (alpha <= 10) that
+        # would otherwise skew the bounding box and offset the logo.
+        threshold = 10
+        for y in range(height):
+            for x in range(width):
+                if image.pixelColor(x, y).alpha() > threshold:
+                    if x < min_x:
+                        min_x = x
+                    if x > max_x:
+                        max_x = x
+                    if y < min_y:
+                        min_y = y
+                    if y > max_y:
+                        max_y = y
+        if max_x < 0 or max_y < 0:
+            # No visible content found
+            return pixmap
+        crop_rect = QRect(min_x, min_y, max_x - min_x + 1, max_y - min_y + 1)
+        return pixmap.copy(crop_rect)
+
     def init_ui(self):
         self.setWindowTitle("Anilag - Loading")
         self.setFixedSize(600, 550)
@@ -69,56 +108,72 @@ class LoadingScreen(QWidget):
         self._center_window()
         
         layout = QVBoxLayout()
-        layout.setAlignment(Qt.AlignCenter)
         layout.setSpacing(15)
         layout.setContentsMargins(40, 40, 40, 40)
         
-        # Logo container with shadow effect
+        # Top stretch centers the content block vertically (paired with the
+        # bottom stretch). Do NOT use layout.setAlignment(Qt.AlignCenter) here -
+        # it conflicts with the stretch items and pushes the logo off-center.
+        layout.addStretch()
+        
+        # Logo container - no box/border, transparent background.
+        # The source logo has transparent padding around the actual artwork,
+        # so the pixmap is cropped to its content bounding box before scaling
+        # (see _crop_to_content). This ensures only the logo itself is shown.
+        # Container sized so the total content fits within the 550px window
+        # with room for top/bottom stretches to vertically center the block.
         self.logo_container = QLabel()
         self.logo_container.setAlignment(Qt.AlignCenter)
         self.logo_container.setFixedSize(220, 220)
+        self.logo_container.setStyleSheet("""
+            QLabel {
+                background: transparent;
+                border: none;
+                padding: 0px;
+            }
+        """)
         
         if self.logo_path and os.path.exists(self.logo_path):
             pixmap = QPixmap(self.logo_path)
-            # Scale to fit container while maintaining aspect ratio
+            # Crop transparent padding so only the logo artwork remains
+            pixmap = self._crop_to_content(pixmap)
+            # Scale cropped logo to fill the container while keeping aspect ratio
             scaled = pixmap.scaled(
-                200, 200, 
+                220, 220, 
                 Qt.KeepAspectRatio, 
                 Qt.SmoothTransformation
             )
             self.logo_container.setPixmap(scaled)
-            
-            # Add subtle drop shadow to logo
-            shadow = QGraphicsDropShadowEffect(self)
-            shadow.setBlurRadius(20)
-            shadow.setColor(QColor(0, 0, 0, 40))
-            shadow.setOffset(0, 4)
-            self.logo_container.setGraphicsEffect(shadow)
         else:
             # Fallback: styled text logo
             self.logo_container.setText("ANILAG")
-            self.logo_container.setFont(QFont("Arial", 52, QFont.Bold))
+            self.logo_container.setFont(QFont("Arial", 64, QFont.Bold))
             self.logo_container.setStyleSheet("""
                 QLabel {
                     color: #2E7D32;
-                    background-color: transparent;
+                    background: transparent;
+                    border: none;
                 }
             """)
         
         layout.addWidget(self.logo_container, alignment=Qt.AlignCenter)
         
         # Add spacing after logo
-        layout.addSpacing(60)
+        layout.addSpacing(20)
         
-        # Tagline
-        tagline_label = QLabel("Rice Weevil Detection System")
-        tagline_label.setFont(QFont("Arial", 16, QFont.Bold))
+        # Tagline - compressed (smaller font + word wrap) so the long title
+        # "Rice Weevil Detection and Control System" fits within the 520px
+        # content width instead of overflowing the window.
+        tagline_label = QLabel("Rice Weevil Detection and Control System")
+        tagline_label.setFont(QFont("Arial", 13, QFont.Bold))
         tagline_label.setStyleSheet("color: #666666;")
         tagline_label.setAlignment(Qt.AlignCenter)
+        tagline_label.setWordWrap(True)
+        tagline_label.setMaximumWidth(520)
         layout.addWidget(tagline_label)
         
         # Add spacing after tagline
-        layout.addSpacing(10)
+        layout.addSpacing(8)
         
         # Subtitle/version
         version_label = QLabel("v1.0.0")
@@ -128,7 +183,7 @@ class LoadingScreen(QWidget):
         layout.addWidget(version_label)
         
         # Add spacing after version
-        layout.addSpacing(30)
+        layout.addSpacing(20)
         
         # Loading status text
         self.loading_label = QLabel("Initializing...")

@@ -193,7 +193,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Anilag - Rice Weevil Detection System")
+        self.setWindowTitle("Anilag - Rice Weevil Detection and Control System")
         # Target display is the Raspberry Pi 5 touchscreen at 1024x600.
         self.setGeometry(50, 50, 1024, 600)
         self.setMinimumSize(800, 480)
@@ -349,42 +349,50 @@ class MainWindow(QMainWindow):
         # Create header with logo
         header_widget = QWidget()
         header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(4, 2, 4, 2)
+        header_layout.setSpacing(8)
         header_widget.setLayout(header_layout)
         header_widget.setStyleSheet("background-color: #f5f5f5; border-bottom: 2px solid #ddd;")
-        header_widget.setMaximumHeight(52)
-        
-        # Logo label
-        logo_label = QLabel()
+        header_widget.setFixedHeight(64)
+
+        # Logo label - fills the header height, no box/border around it
+        self.logo_label = QLabel()
+        self.logo_label.setStyleSheet("background: transparent; border: none; padding: 0px;")
+        self.logo_label.setAlignment(Qt.AlignCenter)
         logo_path = os.path.join(os.path.dirname(__file__), '..', '..', 'assets', 'logo.png')
+        self._logo_path = logo_path
         if os.path.exists(logo_path):
             pixmap = QPixmap(logo_path)
-            pixmap = pixmap.scaled(34, 34, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            logo_label.setPixmap(pixmap)
+            # Scale to fill the header height (60px fits the 64px header with 2px margin)
+            pixmap = pixmap.scaled(60, 60, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.logo_label.setPixmap(pixmap)
+            self.logo_label.setMinimumSize(60, 60)
         else:
-            logo_label.setText("ANILAG")
-            logo_label.setFont(QFont("Arial", 14, QFont.Bold))
-            logo_label.setStyleSheet("color: #2E7D32;")
-        header_layout.addWidget(logo_label)
-        
-        # Title and tagline container
+            self.logo_label.setText("ANILAG")
+            self.logo_label.setFont(QFont("Arial", 14, QFont.Bold))
+            self.logo_label.setStyleSheet("color: #2E7D32; background: transparent; border: none;")
+        header_layout.addWidget(self.logo_label)
+
+        # Title and tagline container - vertically centered next to the logo
         title_container = QWidget()
+        title_container.setStyleSheet("background: transparent;")
         title_layout = QVBoxLayout()
         title_layout.setContentsMargins(0, 0, 0, 0)
-        title_layout.setSpacing(1)
+        title_layout.setSpacing(2)
         title_container.setLayout(title_layout)
-        
+
         # Title label
         title_label = QLabel("Anilag")
-        title_label.setFont(QFont("Arial", 15, QFont.Bold))
-        title_label.setStyleSheet("color: #2E7D32;")
+        title_label.setFont(QFont("Arial", 16, QFont.Bold))
+        title_label.setStyleSheet("color: #2E7D32; background: transparent;")
         title_layout.addWidget(title_label)
-        
+
         # Tagline label
-        tagline_label = QLabel("Rice Weevil Detection System")
-        tagline_label.setFont(QFont("Arial", 8))
-        tagline_label.setStyleSheet("color: #666;")
+        tagline_label = QLabel("Rice Weevil Detection and Control System")
+        tagline_label.setFont(QFont("Arial", 9))
+        tagline_label.setStyleSheet("color: #666; background: transparent;")
         title_layout.addWidget(tagline_label)
-        
+
         header_layout.addWidget(title_container)
         
         header_layout.addStretch()
