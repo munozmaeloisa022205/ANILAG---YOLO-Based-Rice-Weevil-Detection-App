@@ -188,6 +188,16 @@ class DualCameraManager:
     """Manages two cameras (left and right) for stereo vision"""
     def __init__(self, left_camera_id: int = 0, right_camera_id: int = 1,
                  width: int = 640, height: int = 480, fps: int = 30):
+        # Guard against both IDs pointing at the same physical device. On Windows,
+        # OpenCV may expose the same camera under multiple indices (e.g. MSMF and
+        # DShow backends), which would make both feeds show identical pictures.
+        # If the IDs match and the camera is not disabled (-1), disable the right
+        # camera so only the left feed is shown.
+        if left_camera_id == right_camera_id and left_camera_id >= 0:
+            print(f"WARNING: Left and right camera IDs are both {left_camera_id}. "
+                  f"Disabling right camera to avoid duplicate feeds. "
+                  f"Set RIGHT_CAMERA_ID to a different device in config.env.")
+            right_camera_id = -1
         self.left_camera = Camera(left_camera_id, width, height, fps)
         self.right_camera = Camera(right_camera_id, width, height, fps)
         self.running = False

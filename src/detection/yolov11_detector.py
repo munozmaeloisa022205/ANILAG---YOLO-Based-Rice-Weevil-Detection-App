@@ -76,6 +76,12 @@ class YOLOv11Detector:
         self._max_det = int(os.getenv('YOLO_MAX_DET', '300'))  # matches the training/val default
         self.use_ncnn = False
         self.loaded_path = model_path
+        # The training dataset was preprocessed with "auto-contrast via adaptive
+        # equalization" (see AI-MODEL/.../README.roboflow.txt). Applying the same
+        # equalization to live frames closes that domain gap, which improves both
+        # precision and recall. CLAHE on the LAB L-channel is the OpenCV equivalent.
+        self.use_clahe = os.getenv('YOLO_CLAHE', 'true').lower() in ('true', '1', 'yes', 'on')
+        self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         # Only these class ids are counted as rice weevils; None means count every class.
         self.weevil_class_ids: Optional[List[int]] = None
         self.is_generic_model = False
@@ -228,12 +234,31 @@ class YOLOv11Detector:
             print(f"NCNN export error: {e}")
             return None
 
+    def _preprocess(self, frame: np.ndarray) -> np.ndarray:
+        """Match the training preprocessing: adaptive-equalize contrast.
+
+        The Roboflow export applied adaptive equalization to every training image,
+        so raw camera frames are out-of-domain for the model. CLAHE is applied to
+        the lightness channel only, preserving colour. Geometry is unchanged, so
+        detection boxes map directly back onto the original frame.
+        """
+        if not self.use_clahe:
+            return frame
+        try:
+            lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+            l_channel, a_channel, b_channel = cv2.split(lab)
+            l_channel = self._clahe.apply(l_channel)
+            return cv2.cvtColor(cv2.merge((l_channel, a_channel, b_channel)), cv2.COLOR_LAB2BGR)
+        except cv2.error:
+            return frame
+
     def detect(self, frame: np.ndarray) -> DetectionResult:
         if not self.initialized or self.model is None or frame is None:
             return DetectionResult([], [], [], [])
 
         try:
             started = time.perf_counter()
+            frame = self._preprocess(frame)
             with self.lock:
                 kwargs = dict(
                     conf=self.confidence_threshold,
@@ -294,6 +319,7 @@ class YOLOv11Detector:
             'device': 'Raspberry Pi 5 CPU' if self._is_pi else 'CPU',
             'classes': self.class_names,
             'weevil_class_ids': self.weevil_class_ids,
+            'clahe': self.use_clahe,
             'confidence_threshold': self.confidence_threshold,
             'iou_threshold': self.iou_threshold,
             'initialized': self.initialized,

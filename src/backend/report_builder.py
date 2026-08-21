@@ -72,7 +72,7 @@ def build_scan_summary(db: DatabaseManager, scan_id: str) -> Optional[Dict]:
         'image_count': len(images),
         'image_total_bytes': sum(i.get('image_bytes') or 0 for i in images),
         'avg_weevil_count': round(stats['avg_count'], 2) if stats.get('avg_count') is not None else None,
-        'recommendation': detections[-1].get('recommendation') if detections else 'No Action Needed',
+        'recommendation': detections[-1].get('recommendation') if detections else 'Activate Mix',
     }
 
     if scan.get('metadata_json'):

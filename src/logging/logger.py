@@ -37,17 +37,35 @@ class DetectionLogger:
             print(f"Logger initialization error: {e}")
             return False
 
-    def generate_recommendation(self, rice_weevil_count: int, is_after_mixing: bool = False) -> str:
+    def generate_recommendation(self, rice_weevil_count: int, is_after_mixing: bool = False,
+                                is_final: bool = False) -> str:
+        """Classify the recommended next step based on the weevil count and scan phase.
+
+        The workflow has three stages, each determined by whether weevils were
+        found and whether the rice has already been through the mixing step:
+
+        Stage 1 - initial scan (is_after_mixing = False):
+            weevils > 0  -> "Activate Mix and Heat" (sift + heat to kill weevils)
+            weevils = 0  -> "Activate Mix" (sift to confirm no weevils are hiding)
+
+        Stage 2 - post-mix scan (is_after_mixing = True):
+            weevils > 0  -> "Activate Mix and Heat" (weevils survived mixing)
+            weevils = 0  -> "Unload Rice" (clean, safe to unload)
+
+        "Activate Mix" and "Unload Rice" are collective decisions made only
+        after the full scan completes (is_final=True). During the scan
+        (is_final=False) a zero count shows "No Action Needed" per frame so the
+        operator sees the live status, not the post-scan verdict.
+        """
+        if rice_weevil_count > 0:
+            return "Activate Mix and Heat"
+        # Zero weevils: the post-scan recommendation depends on the phase, but
+        # during the scan we just report no action for this frame.
+        if not is_final:
+            return "No Action Needed"
         if is_after_mixing:
-            if rice_weevil_count > 0:
-                return "Heat Treatment Needed"
-            else:
-                return "Take Out Rice"
-        else:
-            if rice_weevil_count > 0:
-                return "Mix and Sift Rice"
-            else:
-                return "No Action Needed"
+            return "Unload Rice"
+        return "Activate Mix"
 
     def log_detection(self, rice_weewolf_count: int, temperature: Optional[float], 
                      is_after_mixing: bool = False, activity: str = "Detection") -> DetectionLog:

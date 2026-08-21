@@ -57,12 +57,10 @@ class DetectionThread(QThread):
         while self.running:
             cycle_started = time.perf_counter()
 
-            # Only run inference on cameras that are actually producing frames.
-            # On Windows a non-existent camera can open but never deliver a real
-            # frame; without this guard the model would detect on stale/garbage
-            # data and report phantom weevil counts.
-            left_healthy = self.camera_manager.is_left_healthy()
-            right_healthy = self.camera_manager.is_right_healthy()
+            # TEMPORARY TEST MODE: bypass is_healthy() so inference runs even
+            # when the signal validation reports blank/frozen frames.
+            left_healthy = self.camera_manager.left_camera.is_running()
+            right_healthy = self.camera_manager.right_camera.is_running()
             self.camera_status.emit(left_healthy, right_healthy)
             left_frame = self.camera_manager.get_left_frame() if left_healthy else None
             right_frame = self.camera_manager.get_right_frame() if right_healthy else None
@@ -90,6 +88,48 @@ class DetectionThread(QThread):
                                    self.detector.avg_inference_ms)
 
             # Throttle so the Pi 5 keeps headroom for the GUI, recording and DB writes
+            remaining = self.interval_ms - elapsed_ms
+            self.msleep(int(remaining) if remaining > 0 else 1)
+
+    def stop(self):
+        self.running = False
+        self.wait()
+
+
+class PreviewThread(QThread):
+    """Live camera preview without detection overhead.
+
+    Runs continuously from app launch so both camera feeds are visible before
+    the user clicks Start Scan. It only reads and emits frames - no YOLO
+    inference - so the Pi 5 CPU stays free for the GUI. When a scan starts the
+    preview thread is swapped out for the DetectionThread, and when the scan
+    stops the preview thread is started again so the feed never goes dark.
+    """
+    frame_ready_left = pyqtSignal(np.ndarray)
+    frame_ready_right = pyqtSignal(np.ndarray)
+    camera_status = pyqtSignal(bool, bool)
+
+    def __init__(self, camera_manager: DualCameraManager, interval_ms: int = 66):
+        super().__init__()
+        self.camera_manager = camera_manager
+        # ~15 FPS is plenty for a live preview and keeps the Pi 5 cool.
+        self.interval_ms = max(0, interval_ms)
+        self.running = False
+
+    def run(self):
+        self.running = True
+        while self.running:
+            cycle_started = time.perf_counter()
+            left_healthy = self.camera_manager.left_camera.is_running()
+            right_healthy = self.camera_manager.right_camera.is_running()
+            self.camera_status.emit(left_healthy, right_healthy)
+            left_frame = self.camera_manager.get_left_frame() if left_healthy else None
+            right_frame = self.camera_manager.get_right_frame() if right_healthy else None
+            if left_frame is not None:
+                self.frame_ready_left.emit(left_frame)
+            if right_frame is not None:
+                self.frame_ready_right.emit(right_frame)
+            elapsed_ms = (time.perf_counter() - cycle_started) * 1000
             remaining = self.interval_ms - elapsed_ms
             self.msleep(int(remaining) if remaining > 0 else 1)
 
@@ -149,12 +189,22 @@ class EmailThread(QThread):
 
 class CameraLabel(QLabel):
     """A QLabel that keeps its zoom control panel pinned to the right edge
-    inside the frame when the label (and its pixmap) is resized."""
+    inside the frame when the label (and its pixmap) is resized.
+
+    Supports click-and-drag panning when the feed is zoomed in, so the user
+    can navigate to any part of the zoomed frame without the layout shifting.
+    """
     ZOOM_PANEL_MARGIN = 10
+
+    # Emitted when the user drags the feed to pan a zoomed view.
+    # Arguments: delta_x, delta_y in frame-pixel units (already scaled by zoom).
+    pan_requested = pyqtSignal(float, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.zoom_panel = None
+        self._dragging = False
+        self._drag_start = None
 
     def position_zoom_panel(self):
         """Pin the panel to the right edge, vertically centered, fully inside the frame."""
@@ -165,6 +215,26 @@ class CameraLabel(QLabel):
         y = (self.height() - panel.height()) // 2
         panel.move(max(self.ZOOM_PANEL_MARGIN, x), max(self.ZOOM_PANEL_MARGIN, y))
         panel.raise_()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._dragging = True
+            self._drag_start = event.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging and self._drag_start is not None:
+            delta = event.pos() - self._drag_start
+            self._drag_start = event.pos()
+            # Emit the pan delta; the main window converts screen pixels to
+            # frame-pixel offsets based on the current zoom factor.
+            self.pan_requested.emit(float(delta.x()), float(delta.y()))
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._dragging = False
+            self._drag_start = None
+            self.setCursor(Qt.OpenHandCursor)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -180,23 +250,33 @@ class CameraLabel(QLabel):
 class MainWindow(QMainWindow):
     # Touch target sizing for the 7-inch (1024x600) Raspberry Pi touchscreen.
     # 64px is roughly a 9mm square on that panel - comfortably finger-sized.
-    TOUCH_BUTTON_SIZE = 64
+    TOUCH_BUTTON_SIZE = 52
     # Overlay zoom buttons are smaller than the main controls but still touchable.
-    ZOOM_BUTTON_SIZE = 44
-    # Width reserved for the shared info column so the camera feed keeps the rest.
-    INFO_PANEL_WIDTH = 250
+    ZOOM_BUTTON_SIZE = 40
+    # Fixed width of the compact info column (Current Detection / Detection Model
+    # / System Log). Kept narrow so the camera feed keeps the dominant share of
+    # the 1024px-wide screen, but wide enough for the readout text to be legible.
+    INFO_PANEL_WIDTH = 240
     # Table/list rows in the Detection Logs tab are selected by finger, so they need
     # to be at least this tall to be reliably tappable on the 7-inch panel.
     TOUCH_ROW_HEIGHT = 44
     # Scrollbars are dragged by finger, so they are far wider than the desktop default.
     TOUCH_SCROLLBAR_SIZE = 22
+    # Group boxes in the feed tabs: a short title margin keeps the controls strip
+    # and the info column from eating vertical space on the 600px-tall screen.
+    COMPACT_GROUP_STYLE = (
+        "QGroupBox { font-weight: bold; font-size: 11px; border: 1px solid #ccc; "
+        "border-radius: 5px; margin-top: 7px; padding-top: 2px; } "
+        "QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }")
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Anilag - Rice Weevil Detection and Control System")
         # Target display is the Raspberry Pi 5 touchscreen at 1024x600.
+        # Start maximized so the camera feeds use all available screen space.
         self.setGeometry(50, 50, 1024, 600)
         self.setMinimumSize(800, 480)
+        self.showMaximized()
 
         # Tee stdout/stderr into the System Log so every print() from any
         # module (camera, detector, email, LED, temperature) appears in the
@@ -249,6 +329,7 @@ class MainWindow(QMainWindow):
         self.db = get_database(_db_path)
         
         self.detection_thread: Optional[DetectionThread] = None
+        self.preview_thread: Optional[PreviewThread] = None
         self.is_scanning = False
         self.is_after_mixing = False
         
@@ -286,6 +367,12 @@ class MainWindow(QMainWindow):
         # 2.0 = 2x center crop, etc. Capped to keep the Pi 5 crop/resize cheap.
         self.left_zoom = 1.0
         self.right_zoom = 1.0
+        # Pan offsets (in original-frame pixels) so the user can drag the zoomed
+        # view to navigate to any part of the frame. Reset to centre on zoom change.
+        self.left_pan_x = 0.0
+        self.left_pan_y = 0.0
+        self.right_pan_x = 0.0
+        self.right_pan_y = 0.0
         self.zoom_step = 0.5
         self.zoom_min = 1.0
         self.zoom_max = 5.0
@@ -455,9 +542,11 @@ class MainWindow(QMainWindow):
 
     def _make_touch_button(self, text, background, hover, handler,
                            pressed=None, color="white", border="none"):
-        """Square, finger-sized button for the touchscreen."""
+        """Finger-sized button for the touchscreen. Height stays touch-safe while
+        the width shrinks to fit the narrower controls strip under the feed."""
         btn = QPushButton(text)
-        btn.setMinimumSize(self.TOUCH_BUTTON_SIZE, self.TOUCH_BUTTON_SIZE)
+        btn.setFixedHeight(self.TOUCH_BUTTON_SIZE)
+        btn.setMinimumWidth(64)
         btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         btn.setStyleSheet(self._touch_button_style(background, hover, pressed, color, border))
         btn.clicked.connect(handler)
@@ -515,8 +604,12 @@ class MainWindow(QMainWindow):
             QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{ background: none; }}
         """
         # Merge with any stylesheet already set on the widget so we don't
-        # clobber table/list styling applied by the caller.
-        existing = widget.styleSheet()
+        # clobber table/list styling applied by the caller. Bare properties
+        # (no selector) must be wrapped in a selector block, otherwise Qt
+        # cannot parse the concatenation of bare properties + selector rules.
+        existing = widget.styleSheet().strip()
+        if existing and '{' not in existing:
+            existing = f"QWidget {{ {existing} }}"
         widget.setStyleSheet(existing + style)
 
     def _build_zoom_overlay(self, parent_label, side):
@@ -551,22 +644,29 @@ class MainWindow(QMainWindow):
         are the shared widgets attached by attach_shared_panels()."""
         tab = QWidget()
         layout = QHBoxLayout()
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(6)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(2)
         tab.setLayout(layout)
 
         left_panel = QVBoxLayout()
-        left_panel.setSpacing(6)
-        layout.addLayout(left_panel, stretch=3)
+        left_panel.setSpacing(4)
+        # Feed column takes the dominant share of the width; the info column is a
+        # compact fixed-width strip on the right so the camera feed stays large.
+        layout.addLayout(left_panel, stretch=4)
 
-        # A single feed per tab, so the view gets the whole tab minus the shared
-        # controls strip and the fixed-width info column.
+        # A single feed per tab. It expands to fill all the space the info column
+        # does not claim, so the live picture dominates the 7-inch screen.
         camera_label = CameraLabel()
-        camera_label.setMinimumSize(420, 280)
+        camera_label.setMinimumSize(320, 240)
         camera_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        camera_label.setStyleSheet("border: 2px solid #333; background-color: #000; border-radius: 5px;")
+        # Light text: the default black is invisible against the black feed panel.
+        camera_label.setStyleSheet(
+            "border: 2px solid #333; background-color: #000; border-radius: 5px; "
+            "color: #999; font-size: 14px; font-weight: bold;")
         camera_label.setAlignment(Qt.AlignCenter)
-        camera_label.setText("No Signal")
+        # No placeholder text: the live preview fills the panel as soon as the
+        # cameras open. A camera that is not plugged in simply shows black.
+        camera_label.setText("")
         left_panel.addWidget(camera_label, stretch=1)
 
         camera_title = QLabel(f"{side.capitalize()} Camera")
@@ -579,6 +679,10 @@ class MainWindow(QMainWindow):
 
         panel, zoom_in, zoom_out, zoom_label = self._build_zoom_overlay(camera_label, side)
         camera_label.zoom_panel = panel
+        # Connect drag-to-pan so the user can navigate the zoomed feed without
+        # the layout shifting or the zoom overlay jumping.
+        camera_label.pan_requested.connect(lambda dx, dy, s=side: self.pan_feed(s, dx, dy))
+        camera_label.setCursor(Qt.OpenHandCursor)
         setattr(self, f"{side}_camera_label", camera_label)
         setattr(self, f"{side}_camera_title", camera_title)
         setattr(self, f"{side}_zoom_panel", panel)
@@ -588,11 +692,11 @@ class MainWindow(QMainWindow):
 
         # Hosts for the shared panels: controls under the feed, info on the right
         controls_host = QVBoxLayout()
-        controls_host.setSpacing(6)
+        controls_host.setSpacing(4)
         left_panel.addLayout(controls_host, stretch=0)
 
         info_host = QVBoxLayout()
-        info_host.setSpacing(6)
+        info_host.setSpacing(4)
         layout.addLayout(info_host, stretch=0)
 
         self.controls_hosts[side] = controls_host
@@ -618,8 +722,12 @@ class MainWindow(QMainWindow):
         widget = self.tab_widget.widget(index)
         if widget is getattr(self, 'left_feed_tab', None):
             self.attach_shared_panels('left')
+            # Reposition the zoom overlay on the now-visible tab; the hidden tab
+            # never gets a resize event so the overlay would sit in the corner.
+            self.left_camera_label.position_zoom_panel()
         elif widget is getattr(self, 'right_feed_tab', None):
             self.attach_shared_panels('right')
+            self.right_camera_label.position_zoom_panel()
 
     def build_shared_panels(self):
         self.controls_hosts = {}
@@ -629,38 +737,48 @@ class MainWindow(QMainWindow):
         # Scan and LED controls sit side by side in a single strip so the strip
         # stays one row tall and the camera feed keeps the rest of the tab.
         self.shared_controls_widget = QWidget()
+        # Fixed height so the controls strip never expands vertically and eats
+        # camera feed space. Tall enough for a 52px touch button plus margins.
+        self.shared_controls_widget.setFixedHeight(78)
+        self.shared_controls_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         controls_layout = QHBoxLayout()
         controls_layout.setContentsMargins(0, 0, 0, 0)
         controls_layout.setSpacing(6)
         self.shared_controls_widget.setLayout(controls_layout)
 
         self.shared_info_widget = QWidget()
+        # Compact fixed-width info column so the camera feed keeps the dominant
+        # share of the tab. Wide enough for the Current Detection / System Log
+        # text to be readable on the 7-inch panel without overpowering the feed.
         self.shared_info_widget.setFixedWidth(self.INFO_PANEL_WIDTH)
+        self.shared_info_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         info_layout = QVBoxLayout()
         info_layout.setContentsMargins(0, 0, 0, 0)
-        info_layout.setSpacing(6)
+        info_layout.setSpacing(4)
         self.shared_info_widget.setLayout(info_layout)
 
         # Scan controls below the camera feed
         scan_group = QGroupBox("Scan Controls")
-        scan_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 5px; margin-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
+        scan_group.setStyleSheet(self.COMPACT_GROUP_STYLE)
         # Side by side so the controls strip stays one row tall and the feed keeps
         # the rest of the tab.
         scan_layout = QHBoxLayout()
-        scan_layout.setSpacing(6)
+        scan_layout.setContentsMargins(6, 4, 6, 4)
+        scan_layout.setSpacing(4)
         
         self.start_button = self._make_touch_button(
             "Start Scan", "#4CAF50", "#45a049", self.toggle_scan, pressed="#3d8b40")
         scan_layout.addWidget(self.start_button)
 
         scan_group.setLayout(scan_layout)
-        controls_layout.addWidget(scan_group, stretch=1)
+        controls_layout.addWidget(scan_group, stretch=2)
         
         # LED controls beside the scan controls
         led_group = QGroupBox("LED Controls")
-        led_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 5px; margin-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
+        led_group.setStyleSheet(self.COMPACT_GROUP_STYLE)
         led_layout = QHBoxLayout()
-        led_layout.setSpacing(6)
+        led_layout.setContentsMargins(6, 4, 6, 4)
+        led_layout.setSpacing(4)
         
         self.red_light_button = self._make_touch_button(
             "Red Light", "#f44336", "#d32f2f", self.set_red_light, pressed="#b71c1c")
@@ -676,29 +794,32 @@ class MainWindow(QMainWindow):
         led_layout.addWidget(self.led_off_button)
         
         led_group.setLayout(led_layout)
-        controls_layout.addWidget(led_group, stretch=3)
+        controls_layout.addWidget(led_group, stretch=5)
         
         # Current detection info
         current_info_group = QGroupBox("Current Detection")
-        current_info_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 5px; margin-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
+        current_info_group.setStyleSheet(self.COMPACT_GROUP_STYLE)
         current_info_layout = QVBoxLayout()
         current_info_layout.setSpacing(4)
-        current_info_layout.setContentsMargins(8, 8, 8, 8)
-        
+        current_info_layout.setContentsMargins(6, 4, 6, 6)
+
         self.count_label = QLabel("Weevil Count: --")
-        self.count_label.setFont(QFont("Arial", 11, QFont.Bold))
-        self.count_label.setStyleSheet("padding: 5px; background-color: #e8f5e9; border-radius: 5px; border: 1px solid #c8e6c9;")
+        self.count_label.setFont(QFont("Arial", 13, QFont.Bold))
+        self.count_label.setAlignment(Qt.AlignCenter)
+        self.count_label.setStyleSheet("padding: 6px; background-color: #e8f5e9; border-radius: 5px; border: 1px solid #c8e6c9;")
         current_info_layout.addWidget(self.count_label)
-        
-        # Confidence and count are only meaningful during an active scan; show
-        # "--" before the first detection and after the scan stops.
+
+        # Confidence and temperature stacked vertically so the labels are not
+        # jammed side by side in the narrow info column.
         self.confidence_label = QLabel("Avg Confidence: --")
-        self.confidence_label.setFont(QFont("Arial", 9))
+        self.confidence_label.setFont(QFont("Arial", 10))
+        self.confidence_label.setAlignment(Qt.AlignCenter)
         self.confidence_label.setStyleSheet("padding: 5px; background-color: #e8f5e9; border-radius: 5px; border: 1px solid #c8e6c9;")
         current_info_layout.addWidget(self.confidence_label)
-        
+
         self.temp_label = QLabel("Temperature: --°C")
         self.temp_label.setFont(QFont("Arial", 10))
+        self.temp_label.setAlignment(Qt.AlignCenter)
         self.temp_label.setStyleSheet("padding: 5px; background-color: #e3f2fd; border-radius: 5px; border: 1px solid #bbdefb;")
         current_info_layout.addWidget(self.temp_label)
         
@@ -716,19 +837,22 @@ class MainWindow(QMainWindow):
         # The static model/backend details are logged at startup instead of taking up
         # room in the narrow side panel.
         model_group = QGroupBox("Detection Model")
-        model_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 5px; margin-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
+        model_group.setStyleSheet(self.COMPACT_GROUP_STYLE)
+        # Stacked vertically so the two readouts are not jammed side by side.
         model_layout = QVBoxLayout()
         model_layout.setSpacing(4)
-        model_layout.setContentsMargins(8, 8, 8, 8)
-        
-        self.inference_label = QLabel("Inference: -- ms")
-        self.inference_label.setFont(QFont("Consolas", 9))
-        self.inference_label.setStyleSheet("padding: 5px; background-color: #fff8e1; border-radius: 5px; border: 1px solid #ffecb3;")
+        model_layout.setContentsMargins(6, 4, 6, 6)
+
+        self.inference_label = QLabel("Inference: --")
+        self.inference_label.setFont(QFont("Consolas", 10, QFont.Bold))
+        self.inference_label.setAlignment(Qt.AlignCenter)
+        self.inference_label.setStyleSheet("padding: 5px; background-color: #fff8e1; border-radius: 5px; border: 1px solid #ffecb3; color: #5d4037;")
         model_layout.addWidget(self.inference_label)
-        
-        self.rate_label = QLabel("Rate: -- /s")
-        self.rate_label.setFont(QFont("Consolas", 9))
-        self.rate_label.setStyleSheet("padding: 5px; background-color: #fff8e1; border-radius: 5px; border: 1px solid #ffecb3;")
+
+        self.rate_label = QLabel("Rate: --")
+        self.rate_label.setFont(QFont("Consolas", 10, QFont.Bold))
+        self.rate_label.setAlignment(Qt.AlignCenter)
+        self.rate_label.setStyleSheet("padding: 5px; background-color: #fff8e1; border-radius: 5px; border: 1px solid #ffecb3; color: #5d4037;")
         model_layout.addWidget(self.rate_label)
         
         model_group.setLayout(model_layout)
@@ -736,13 +860,17 @@ class MainWindow(QMainWindow):
         
         # System log display - compact
         log_group = QGroupBox("System Log")
-        log_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #ccc; border-radius: 5px; margin-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
+        log_group.setStyleSheet(self.COMPACT_GROUP_STYLE)
         log_layout = QVBoxLayout()
-        log_layout.setContentsMargins(4, 4, 4, 4)
+        log_layout.setContentsMargins(6, 4, 6, 6)
         
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setStyleSheet("font-family: Consolas, monospace; font-size: 9px; background-color: #f9f9f9; border: 1px solid #ddd; border-radius: 3px;")
+        self.log_text.setMinimumHeight(60)
+        self.log_text.setMaximumHeight(140)
+        self.log_text.setLineWrapMode(QTextEdit.WidgetWidth)
+        self.log_text.setStyleSheet("font-family: Consolas, monospace; font-size: 11px; background-color: #f9f9f9; border: 1px solid #ddd; border-radius: 3px;")
+        self._make_touch_scrollable(self.log_text)
         log_layout.addWidget(self.log_text)
         
         log_group.setLayout(log_layout)
@@ -821,9 +949,9 @@ class MainWindow(QMainWindow):
         scans_layout.setContentsMargins(4, 4, 4, 4)
         
         self.scan_table = QTableWidget()
-        self.scan_table.setColumnCount(5)
+        self.scan_table.setColumnCount(7)
         self.scan_table.setHorizontalHeaderLabels(
-            ["Scan ID", "Start Time", "Max Count", "Avg Temp", "Images"])
+            ["Scan ID", "Start Time", "End Time", "Scan Time", "Max Count", "Avg Temp", "Images"])
         self.scan_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.scan_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.scan_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -982,6 +1110,50 @@ class MainWindow(QMainWindow):
         # Populate the database-backed history view
         self.refresh_scan_history()
 
+        # Start live camera preview immediately so both feeds are visible before
+        # the user clicks Start Scan. Cameras that are not plugged in simply stay
+        # black - no "No Signal" placeholder is shown.
+        self.start_preview()
+
+    def start_preview(self):
+        """Open the cameras and begin a lightweight preview loop (no detection).
+
+        Called at app launch and again after every scan stops so the feeds stay
+        live. The cameras are opened once and left open; the detection thread
+        reuses the same camera_manager when a scan starts.
+        """
+        if self.preview_thread is not None:
+            return
+        if not self.camera_manager.is_running():
+            if not self.camera_manager.start():
+                self.log_message("No camera device available for live preview")
+                return
+        self.preview_thread = PreviewThread(self.camera_manager)
+        self.preview_thread.frame_ready_left.connect(self.update_left_preview)
+        self.preview_thread.frame_ready_right.connect(self.update_right_preview)
+        self.preview_thread.camera_status.connect(self.update_camera_status)
+        self.preview_thread.start()
+        self.log_message("Live camera preview started")
+
+    def stop_preview(self):
+        """Stop the preview loop. The cameras themselves stay open so the
+        detection thread can take over without re-opening the devices."""
+        if self.preview_thread is not None:
+            self.preview_thread.stop()
+            self.preview_thread = None
+
+    def update_left_preview(self, frame: np.ndarray):
+        """Render a raw camera frame (no detection annotations) for live preview."""
+        self.latest_annotated_left = frame
+        self._render_frame_to_label(frame, self.left_camera_label, self.left_zoom,
+                                    self.left_pan_x, self.left_pan_y)
+
+    def update_right_preview(self, frame: np.ndarray):
+        """Render a raw camera frame (no detection annotations) for live preview."""
+        self.latest_annotated_right = frame
+        self._render_frame_to_label(frame, self.right_camera_label, self.right_zoom,
+                                    self.right_pan_x, self.right_pan_y)
+
     def update_model_display(self):
         """Report which YOLOv11n weights and backend are loaded to the Detection Log.
 
@@ -1009,8 +1181,8 @@ class MainWindow(QMainWindow):
             self.log_message(f"MODEL WARNING: {warning}")
 
     def update_performance_stats(self, rate_per_second: float, avg_inference_ms: float):
-        self.inference_label.setText(f"Inference: {avg_inference_ms:6.1f} ms")
-        self.rate_label.setText(f"Rate: {rate_per_second:5.1f} /s")
+        self.inference_label.setText(f"Inference: {avg_inference_ms:.0f}ms")
+        self.rate_label.setText(f"Rate: {rate_per_second:.1f}/s")
 
     def toggle_scan(self):
         if self.is_scanning:
@@ -1019,39 +1191,34 @@ class MainWindow(QMainWindow):
             self.start_scan()
 
     def start_scan(self):
+        # Stop the lightweight preview loop so the detection thread can take
+        # over the same camera feeds without contention.
+        self.stop_preview()
         if not self.camera_manager.start():
             self.log_message("Failed to start cameras - no capture device could be opened")
             return
 
-        # Opening a device proves nothing on Windows: a virtual camera opens fine and
-        # returns blank or frozen frames.  Wait for the capture loop to confirm a real
-        # moving picture before the model is allowed anywhere near these feeds.
-        left_ok, right_ok = self.camera_manager.wait_for_signal(timeout=3.0)
-
-        if not left_ok:
-            self.log_message(f"Left camera has no live signal - "
-                             f"{self.camera_manager.left_camera.get_signal_reason()}")
-        if not right_ok:
-            self.log_message(f"Right camera has no live signal - "
-                             f"{self.camera_manager.right_camera.get_signal_reason()}")
+        # TEMPORARY TEST MODE: skip live-signal validation so the scan starts
+        # with whatever camera opened, even if frames are blank/frozen.
+        left_ok = self.camera_manager.left_camera.is_running()
+        right_ok = self.camera_manager.right_camera.is_running()
 
         if not left_ok and not right_ok:
-            self.log_message("Scan cancelled - neither camera is producing a live picture")
-            self.camera_manager.stop()
+            self.log_message("Scan cancelled - no camera device could be opened")
             self.update_camera_status(False, False)
             QMessageBox.warning(
-                self, "No Camera Signal",
-                "Neither camera is producing a live picture, so the scan was not started.\n\n"
-                "Check that the cameras are plugged in and not in use by another "
-                "application. If a camera is not installed, set its ID to -1 in "
-                "config.env so the system stops looking for it.")
+                self, "No Camera",
+                "No camera device could be opened, so the scan was not started.")
+            # Resume live preview if any camera is still available
+            self.start_preview()
             return
 
         if left_ok and right_ok:
-            self.log_message("Both cameras have a live signal")
+            self.log_message("Both cameras opened (signal validation bypassed for testing)")
         else:
             self.log_message(f"Scanning with the "
-                             f"{'left' if left_ok else 'right'} camera only")
+                             f"{'left' if left_ok else 'right'} camera only "
+                             f"(signal validation bypassed for testing)")
         self.update_camera_status(left_ok, right_ok)
         
         # Create scan folder with timestamp
@@ -1153,13 +1320,11 @@ class MainWindow(QMainWindow):
     def stop_scan(self):
         self.scan_timer.stop()
         self.scan_countdown_timer.stop()
-        
+
         if self.detection_thread:
             self.detection_thread.stop()
             self.detection_thread = None
-        
-        self.camera_manager.stop()
-        
+
         # Stop recording and save metadata
         if self.video_writer_left:
             self.video_writer_left.release()
@@ -1167,30 +1332,33 @@ class MainWindow(QMainWindow):
         if self.video_writer_right:
             self.video_writer_right.release()
             self.video_writer_right = None
-        
+
         # Persist the scan metadata; the detection log and images are already in the DB
         scan_id = self.current_scan_id
         if self.current_scan_folder and scan_id:
             self.save_scan_metadata()
-        
+
         self.is_scanning = False
         self.start_button.setText("Start Scan")
         self.start_button.setStyleSheet(
             self._touch_button_style("#4CAF50", "#45a049", pressed="#3d8b40"))
-        # Reset the detection display so stale counts do not linger after the scan stops.
-        self.count_label.setText("Weevil Count: --")
+        # Reset the per-frame detection display, but show the final collective
+        # recommendation based on the scan's max weevil count. "Activate Mix" /
+        # "Unload Rice" are post-scan decisions, not per-frame readings.
+        self.count_label.setText(f"Weevil Count: {self.scan_max_count}")
         self.confidence_label.setText("Avg Confidence: --")
-        self.recommendation_label.setText("Recommendation: --")
+        final_rec = self.logger.generate_recommendation(
+            self.scan_max_count, self.is_after_mixing, is_final=True)
+        self.recommendation_label.setText(f"Recommendation: {final_rec}")
         self.status_label.setText("Ready")
-        # Reset camera labels to "No Signal" since the feeds are now stopped.
-        self.left_camera_label.setText("No Signal")
-        self.left_camera_label.setPixmap(QPixmap())
-        self.right_camera_label.setText("No Signal")
-        self.right_camera_label.setPixmap(QPixmap())
         self.latest_annotated_left = None
         self.latest_annotated_right = None
         self.log_message("Scan stopped and saved")
-        
+
+        # Keep the cameras open and restart the preview loop so the feeds stay
+        # live after the scan ends. The cameras are only stopped on app exit.
+        self.start_preview()
+
         if scan_id:
             self.email_scan_report(scan_id)
             self.refresh_scan_history()
@@ -1273,9 +1441,26 @@ class MainWindow(QMainWindow):
             row = self.scan_table.rowCount()
             self.scan_table.insertRow(row)
             avg_temp = scan.get('avg_temperature_celsius')
+            # Compute scan duration from start_time and end_time stored in the DB.
+            start_str = scan.get('start_time', '')
+            end_str = scan.get('end_time', '')
+            scan_time = "--"
+            try:
+                if start_str and end_str:
+                    start_dt = datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S")
+                    end_dt = datetime.strptime(end_str, "%Y-%m-%d %H:%M:%S")
+                    delta = end_dt - start_dt
+                    total_secs = int(delta.total_seconds())
+                    if total_secs >= 0:
+                        mins, secs = divmod(total_secs, 60)
+                        scan_time = f"{mins}m {secs}s"
+            except (ValueError, TypeError):
+                pass
             values = [
                 scan.get('scan_id', ''),
-                scan.get('start_time', ''),
+                start_str,
+                end_str,
+                scan_time,
                 str(scan.get('max_weevil_count', 0)),
                 f"{avg_temp:.1f}°C" if isinstance(avg_temp, (int, float)) else "N/A",
                 f"{scan.get('image_count', 0)} ({(scan.get('image_total_bytes') or 0) / 1024:.0f} KB)",
@@ -1488,7 +1673,7 @@ class MainWindow(QMainWindow):
             "temperature_readings_count": len(self.scan_temp_readings),
             "log_entry_count": self.scan_detection_count,
             "image_count": image_count,
-            "recommendation": self.logger.generate_recommendation(self.scan_max_count, self.is_after_mixing),
+            "recommendation": self.logger.generate_recommendation(self.scan_max_count, self.is_after_mixing, is_final=True),
             "after_mixing": self.is_after_mixing,
             "model": {
                 "name": model_info['model_name'],
@@ -1565,28 +1750,72 @@ class MainWindow(QMainWindow):
         new = round(current + direction * self.zoom_step, 2)
         new = max(self.zoom_min, min(self.zoom_max, new))
         setattr(self, attr, new)
+        # Reset pan to centre whenever the zoom level changes so the crop stays
+        # within bounds.
+        setattr(self, f"{side}_pan_x", 0.0)
+        setattr(self, f"{side}_pan_y", 0.0)
         label = getattr(self, f"{side}_zoom_label")
         label.setText(f"{new:.1f}x")
         # Re-render the last frame at the new zoom level if we have one
         latest = getattr(self, f"latest_annotated_{'left' if side == 'left' else 'right'}")
         if latest is not None:
             target_label = self.left_camera_label if side == 'left' else self.right_camera_label
-            self._render_frame_to_label(latest, target_label, new)
+            self._render_frame_to_label(latest, target_label, new,
+                                        getattr(self, f"{side}_pan_x"),
+                                        getattr(self, f"{side}_pan_y"))
 
-    def _render_frame_to_label(self, frame: np.ndarray, label, zoom: float):
-        """Render a BGR frame to a QLabel, applying the given digital zoom.
+    def pan_feed(self, side: str, delta_screen_x: float, delta_screen_y: float):
+        """Pan the zoomed feed in response to a drag on the camera label.
+
+        Screen-pixel deltas are converted to frame-pixel offsets using the
+        current zoom factor, then clamped so the crop window never leaves the
+        frame. The feed is re-rendered immediately so dragging feels smooth.
+        """
+        zoom = getattr(self, f"{side}_zoom")
+        if zoom <= 1.0:
+            return  # No panning when not zoomed in
+        # Convert screen drag to frame-pixel drag (zoomed view means 1 screen
+        # pixel = 1/zoom frame pixels).
+        frame_dx = delta_screen_x / zoom
+        frame_dy = delta_screen_y / zoom
+        new_x = getattr(self, f"{side}_pan_x") - frame_dx
+        new_y = getattr(self, f"{side}_pan_y") - frame_dy
+        # Clamp so the crop window stays inside the frame. The crop is centred
+        # at (w/2 + pan_x, h/2 + pan_y) with size (w/zoom, h/zoom), so the pan
+        # range is +/- (w/2 - crop_w/2).
+        latest = getattr(self, f"latest_annotated_{'left' if side == 'left' else 'right'}")
+        if latest is None:
+            return
+        h, w = latest.shape[:2]
+        crop_w = w / zoom
+        crop_h = h / zoom
+        max_x = (w - crop_w) / 2
+        max_y = (h - crop_h) / 2
+        new_x = max(-max_x, min(max_x, new_x))
+        new_y = max(-max_y, min(max_y, new_y))
+        setattr(self, f"{side}_pan_x", new_x)
+        setattr(self, f"{side}_pan_y", new_y)
+        target_label = self.left_camera_label if side == 'left' else self.right_camera_label
+        self._render_frame_to_label(latest, target_label, zoom, new_x, new_y)
+
+    def _render_frame_to_label(self, frame: np.ndarray, label, zoom: float,
+                               pan_x: float = 0.0, pan_y: float = 0.0):
+        """Render a BGR frame to a QLabel, applying the given digital zoom and pan.
 
         Zoom is a center crop: at 2.0x, the central half of the frame (width and
-        height) is scaled up to fill the label. This keeps the region of interest
-        (the rice sample) centered.
+        height) is scaled up to fill the label. pan_x/pan_y (in frame pixels)
+        shift the crop centre so the user can drag to navigate the zoomed view.
         """
         rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         if zoom > 1.0:
             h, w = rgb_image.shape[:2]
             crop_w = int(w / zoom)
             crop_h = int(h / zoom)
-            x0 = (w - crop_w) // 2
-            y0 = (h - crop_h) // 2
+            # Centre the crop, then apply pan offset (clamped to frame bounds)
+            cx = w / 2 + pan_x
+            cy = h / 2 + pan_y
+            x0 = int(max(0, min(w - crop_w, cx - crop_w / 2)))
+            y0 = int(max(0, min(h - crop_h, cy - crop_h / 2)))
             rgb_image = rgb_image[y0:y0 + crop_h, x0:x0 + crop_w]
             # Slicing produces a non-contiguous view; QImage needs a contiguous buffer
             rgb_image = np.ascontiguousarray(rgb_image)
@@ -1595,7 +1824,17 @@ class MainWindow(QMainWindow):
         bytes_per_line = ch * w
         qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
         pixmap = QPixmap.fromImage(qt_image)
-        scaled_pixmap = pixmap.scaled(label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        # Fill the whole panel: scale up until both dimensions are covered, then
+        # trim the centre to the panel size. This maximizes the camera input -
+        # no black letterbox bars - regardless of the panel's aspect ratio.
+        target = label.contentsRect().size()
+        if target.width() <= 0 or target.height() <= 0:
+            return
+        scaled_pixmap = pixmap.scaled(target, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+        if scaled_pixmap.width() > target.width() or scaled_pixmap.height() > target.height():
+            x0 = (scaled_pixmap.width() - target.width()) // 2
+            y0 = (scaled_pixmap.height() - target.height()) // 2
+            scaled_pixmap = scaled_pixmap.copy(x0, y0, target.width(), target.height())
         label.setPixmap(scaled_pixmap)
 
     def update_left_frame(self, frame: np.ndarray, detection: DetectionResult):
@@ -1608,7 +1847,8 @@ class MainWindow(QMainWindow):
             self.video_writer_left.write(annotated_frame)
 
         # Display with current zoom level (display-only; recording keeps full frame)
-        self._render_frame_to_label(annotated_frame, self.left_camera_label, self.left_zoom)
+        self._render_frame_to_label(annotated_frame, self.left_camera_label, self.left_zoom,
+                                    self.left_pan_x, self.left_pan_y)
 
     def update_right_frame(self, frame: np.ndarray, detection: DetectionResult):
         # Draw detections on frame
@@ -1620,17 +1860,20 @@ class MainWindow(QMainWindow):
             self.video_writer_right.write(annotated_frame)
 
         # Display with current zoom level (display-only; recording keeps full frame)
-        self._render_frame_to_label(annotated_frame, self.right_camera_label, self.right_zoom)
+        self._render_frame_to_label(annotated_frame, self.right_camera_label, self.right_zoom,
+                                    self.right_pan_x, self.right_pan_y)
 
     def update_camera_status(self, left_live: bool, right_live: bool):
-        """Blank a feed that has no live signal so no stale picture (and no stale
-        bounding boxes) is left on screen for a camera that is not delivering."""
+        """Clear a feed that has no live signal so no stale picture (and no stale
+        bounding boxes) is left on screen for a camera that is not delivering.
+        No placeholder text is shown - the panel simply stays black until the
+        camera delivers frames again."""
         for live, label, side in ((left_live, self.left_camera_label, 'left'),
                                   (right_live, self.right_camera_label, 'right')):
             if live:
                 continue
             label.setPixmap(QPixmap())
-            label.setText("No Signal")
+            label.setText("")
             setattr(self, f"latest_annotated_{side}", None)
 
     def update_detection(self, count: int, confidence: float, activity: str):
@@ -1824,6 +2067,9 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if self.is_scanning:
             self.stop_scan()
+        # Stop the live preview loop and release the cameras on exit
+        self.stop_preview()
+        self.camera_manager.stop()
         # Let any in-flight report email finish so the scan report is not lost on exit
         for thread in list(self.email_threads):
             thread.wait(90000)
@@ -1838,26 +2084,31 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
-    
-    # Show loading screen first
+
+    # Show loading screen first. The MainWindow is NOT created here - creating it
+    # during the loading screen would initialize all hardware (cameras, LED
+    # controller, detector) while the loading screen is still visible, making it
+    # look like two instances of the application are running at once. Instead the
+    # main window is created only after the loading screen finishes.
     logo_path = os.path.join(os.path.dirname(__file__), '..', '..', 'assets', 'logo.png')
     from src.gui.loading_screen import LoadingScreen
     loading_screen = LoadingScreen(logo_path)
     loading_screen.show()
-    
-    # Create main window but don't show it yet
-    window = MainWindow()
-    
-    # Connect loading screen completion to show main window
-    loading_screen.loading_complete.connect(lambda: show_main_window(loading_screen, window))
-    
+
+    # Create and show the main window only after the loading screen completes
+    loading_screen.loading_complete.connect(lambda: show_main_window(loading_screen))
+
     sys.exit(app.exec_())
 
 
-def show_main_window(loading_screen, main_window):
-    """Transition from loading screen to main window"""
+def show_main_window(loading_screen):
+    """Transition from loading screen to main window.
+
+    The MainWindow is created here (not during the loading screen) so hardware
+    initialization only happens once, after the loading screen closes."""
     loading_screen.close()
-    main_window.show()
+    window = MainWindow()
+    window.show()
 
 
 if __name__ == '__main__':

@@ -214,7 +214,10 @@ class LEDController:
                     self.strip.setPixelColor(i, color)
                 self.strip.show()
                 return True
-            print(f"Simulation: WS2813 x{self.led_count} -> RGB({r}, {g}, {b})")
+            # Only print the simulation message when the colour actually changes,
+            # so turning off to (0,0,0) on cleanup doesn't spam the console.
+            if (r, g, b) != (0, 0, 0) or self.current_mode != 'off':
+                print(f"Simulation: WS2813 x{self.led_count} -> RGB({r}, {g}, {b})")
             return False
         except Exception as e:
             print(f"LED color set error: {e}")
