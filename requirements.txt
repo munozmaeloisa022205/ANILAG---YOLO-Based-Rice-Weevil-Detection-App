@@ -4,7 +4,9 @@
 # source and fails, so install it from apt instead and create the venv with
 # --system-site-packages (start.sh already does this):
 #     sudo apt install -y python3-pyqt5
-PyQt5==5.15.10; platform_machine != "aarch64" and platform_machine != "armv7l"
+# 5.15.11 is the first release whose wheels are built against Python 3.13 (the
+# wheels use the stable cp39-abi3 ABI, so they also install on 3.13/3.14).
+PyQt5==5.15.11; platform_machine != "aarch64" and platform_machine != "armv7l"
 
 ultralytics>=8.3.0
 
@@ -15,10 +17,17 @@ ultralytics>=8.3.0
 # failed xcb platform plugin. The headless wheel simply omits the unused
 # highgui module (all display goes through PyQt5, this code never calls
 # cv2.imshow) and is otherwise identical.
-opencv-python-headless==4.9.0.80; platform_machine == "aarch64" or platform_machine == "armv7l"
-opencv-python==4.9.0.80; platform_machine != "aarch64" and platform_machine != "armv7l"
-numpy==1.26.4
-pillow==10.3.0
+# 4.11.0.86 is the first release with cp313 wheels (Python 3.13 support was
+# added in that build); 4.9.0.80 has none and pip would try to compile OpenCV
+# from source on Python 3.13.
+opencv-python-headless>=4.11.0.86; platform_machine == "aarch64" or platform_machine == "armv7l"
+opencv-python>=4.11.0.86; platform_machine != "aarch64" and platform_machine != "armv7l"
+# numpy 1.26.x has no cp313 wheels (Python 3.13 support landed in numpy 2.1.0).
+# numpy 2.x is compatible with the code here (no removed scalar aliases such as
+# np.int/np.float are used) and with ultralytics >=8.3 and opencv >=4.11.
+numpy>=2.1.0
+# Pillow 10.x has no cp313 wheels; Python 3.13 support shipped in Pillow 11.0.0.
+pillow>=11.0.0
 pyserial==3.5
 python-dotenv==1.0.1
 ncnn>=1.0.20250501
