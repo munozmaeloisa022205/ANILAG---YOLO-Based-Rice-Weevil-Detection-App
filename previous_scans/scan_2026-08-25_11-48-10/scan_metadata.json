@@ -1,0 +1,55 @@
+{
+    "scan_id": "scan_2026-08-25_11-48-10",
+    "scan_start_time": "2026-08-25 11:48:10",
+    "scan_end_time": "2026-08-25 11:51:11",
+    "duration_seconds": 180,
+    "protocol_duration_seconds": 180,
+    "max_weevil_count": 4,
+    "average_temperature_celsius": 0.0,
+    "temperature_readings_count": 0,
+    "log_entry_count": 19,
+    "image_count": 5,
+    "recommendation": "Activate Mix and Heat",
+    "after_mixing": false,
+    "model": {
+        "name": "sitophilus_oryzae_v2-3_best_ncnn_model",
+        "architecture": "YOLOv11n",
+        "backend": "NCNN",
+        "imgsz": 640,
+        "confidence_threshold": 0.6,
+        "classes": [
+            "Sitophilus Oryzae"
+        ]
+    },
+    "avg_inference_ms": 66.2,
+    "temperature_sensor": {
+        "device_id": "",
+        "available": false,
+        "temperature_celsius": null,
+        "reading_age_seconds": null,
+        "stale": false,
+        "samples": 0,
+        "reads": 0,
+        "errors": 0,
+        "poll_interval": 2.0,
+        "last_error": "1-Wire not enabled: /sys/bus/w1/devices missing. Add 'dtoverlay=w1-gpio,gpiopin=4' to /boot/firmware/config.txt and reboot."
+    },
+    "led_controller": {
+        "backend": "simulation",
+        "initialized": true,
+        "led_count": 60,
+        "brightness": 255,
+        "mode": "off",
+        "color": [
+            0,
+            0,
+            0
+        ],
+        "color_order": "GRB",
+        "error": "spidev not installed (pip install spidev)"
+    },
+    "videos": {
+        "left_camera": "left_camera.avi",
+        "right_camera": null
+    }
+}

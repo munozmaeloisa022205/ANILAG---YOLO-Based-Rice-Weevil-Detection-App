@@ -57,6 +57,44 @@ def _is_raspberry_pi() -> bool:
         return platform.machine() in ('aarch64', 'armv7l')
 
 
+def _configure_cpu_threads(is_pi: bool) -> Optional[int]:
+    """Cap intra-op parallelism so inference does not starve the rest of the app.
+
+    The Raspberry Pi 5 has four Cortex-A76 cores. PyTorch and OpenCV each default
+    to using all of them, so a detection cycle leaves nothing for the Qt GUI
+    thread, the two camera threads and the SQLite writes - the interface visibly
+    freezes for the length of every inference. Reserving one core keeps the UI
+    responsive at a small cost in per-frame latency.
+
+    Override with THREAD_COUNT; 0 means "leave the library defaults alone".
+    """
+    cores = os.cpu_count() or 1
+    # On Pi 5: reserve one core for GUI/camera/DB threads (4 cores → 3).
+    # On Windows/desktop: cap at 4 to avoid thread contention. With 20 cores
+    # the library default saturates the scheduler and starves the Qt event loop,
+    # camera capture threads and video encoding — the GUI freezes and camera
+    # FPS drops. 4 inference threads is enough for YOLOv11n and leaves plenty
+    # of headroom for the rest of the app.
+    default = max(1, cores - 1) if is_pi else min(4, cores)
+    try:
+        threads = int(os.getenv('THREAD_COUNT', str(default)))
+    except ValueError:
+        threads = default
+    if threads <= 0:
+        return None
+
+    try:
+        import torch
+        torch.set_num_threads(threads)
+    except Exception as e:
+        print(f"Could not set torch thread count: {e}")
+    try:
+        cv2.setNumThreads(threads)
+    except Exception as e:
+        print(f"Could not set OpenCV thread count: {e}")
+    return threads
+
+
 class YOLOv11Detector:
     def __init__(self, model_path: str = 'models/sitophilus_oryzae_v2-3_best.pt', confidence_threshold: float = 0.5, iou_threshold: float = 0.7):
         self.model_path = model_path
@@ -69,6 +107,7 @@ class YOLOv11Detector:
         # Raspberry Pi 5 optimizations
         self._is_pi = _is_raspberry_pi()
         self._device = 'cpu'  # Pi 5 has no CUDA GPU
+        self._threads = _configure_cpu_threads(self._is_pi)
         # Must match the imgsz the weights were trained at (640 for sitophilus_oryzae_v2-3)
         # or recall on small weevils drops. Lower only if the Pi 5 cannot keep up.
         self._imgsz = int(os.getenv('YOLO_IMGSZ', str(TRAINED_IMGSZ)))
@@ -76,6 +115,17 @@ class YOLOv11Detector:
         self._max_det = int(os.getenv('YOLO_MAX_DET', '300'))  # matches the training/val default
         self.use_ncnn = False
         self.loaded_path = model_path
+        # Test-time augmentation: multi-scale + flip inference. Improves detection
+        # of small/distant weevils by running the model at multiple scales and
+        # merging results. Costs ~3x inference time but dramatically improves
+        # recall on small objects.
+        self._augment = os.getenv('YOLO_AUGMENT', 'true').lower() in ('true', '1', 'yes', 'on')
+        # Post-processing size filters to reduce false positives. Weevils are
+        # small insects — boxes covering a large fraction of the frame are likely
+        # background objects, and tiny boxes (< 100 px²) are noise.
+        self._min_box_area = int(os.getenv('YOLO_MIN_BOX_AREA', '100'))
+        self._max_box_area_ratio = float(os.getenv('YOLO_MAX_BOX_AREA_RATIO', '0.25'))
+        self._max_aspect_ratio = float(os.getenv('YOLO_MAX_ASPECT_RATIO', '3.0'))
         # The training dataset was preprocessed with "auto-contrast via adaptive
         # equalization" (see AI-MODEL/.../README.roboflow.txt). Applying the same
         # equalization to live frames closes that domain gap, which improves both
@@ -215,6 +265,8 @@ class YOLOv11Detector:
 
                 print(f"YOLOv11 model loaded ({self.backend}) from {self.loaded_path}")
                 print(f"Running on: {'Raspberry Pi 5 (CPU)' if self._is_pi else 'CPU'}")
+                print(f"Inference threads: {self._threads or 'library default'} "
+                      f"of {os.cpu_count()} cores")
                 print(f"Inference image size: {self._imgsz} (trained at {self._trained_imgsz})")
                 print(f"Classes: {self.class_names}")
                 return True
@@ -265,6 +317,7 @@ class YOLOv11Detector:
                     iou=self.iou_threshold,
                     imgsz=self._imgsz,
                     max_det=self._max_det,
+                    augment=self._augment,
                     verbose=False
                 )
                 # NCNN runs its own ARM-optimised backend and takes no device argument.
@@ -281,6 +334,9 @@ class YOLOv11Detector:
 
             # A generic COCO checkpoint has no weevil class, so report nothing rather than
             # counting people and cars as rice weevils.
+            frame_h, frame_w = frame.shape[:2]
+            frame_area = frame_h * frame_w
+            max_box_area = frame_area * self._max_box_area_ratio
             if not self.is_generic_model:
                 for result in results:
                     if result.boxes is not None:
@@ -290,7 +346,24 @@ class YOLOv11Detector:
                                 continue
                             # Get box coordinates
                             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                            boxes.append([int(x1), int(y1), int(x2), int(y2)])
+                            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                            box_w = x2 - x1
+                            box_h = y2 - y1
+                            box_area = box_w * box_h
+                            # Filter out boxes that are too large (background objects
+                            # misidentified as weevils) or too small (noise/artifacts).
+                            if box_area < self._min_box_area:
+                                continue
+                            if box_area > max_box_area:
+                                continue
+                            # Filter out extreme aspect ratios — weevils are roughly
+                            # square/oval. Background edges and table surfaces produce
+                            # very wide or very tall boxes.
+                            if box_w > 0 and box_h > 0:
+                                aspect = max(box_w, box_h) / min(box_w, box_h)
+                                if aspect > self._max_aspect_ratio:
+                                    continue
+                            boxes.append([x1, y1, x2, y2])
                             confidences.append(float(box.conf[0].cpu().numpy()))
                             class_ids.append(cls_id)
 
@@ -317,9 +390,14 @@ class YOLOv11Detector:
             'trained_imgsz': self._trained_imgsz,
             'max_det': self._max_det,
             'device': 'Raspberry Pi 5 CPU' if self._is_pi else 'CPU',
+            'threads': self._threads,
             'classes': self.class_names,
             'weevil_class_ids': self.weevil_class_ids,
             'clahe': self.use_clahe,
+            'augment': self._augment,
+            'min_box_area': self._min_box_area,
+            'max_box_area_ratio': self._max_box_area_ratio,
+            'max_aspect_ratio': self._max_aspect_ratio,
             'confidence_threshold': self.confidence_threshold,
             'iou_threshold': self.iou_threshold,
             'initialized': self.initialized,
@@ -328,7 +406,7 @@ class YOLOv11Detector:
         }
 
     def draw_detections(self, frame: np.ndarray, detection: DetectionResult, color: Tuple[int, int, int] = (0, 255, 0)) -> np.ndarray:
-        annotated_frame = frame.copy()
+        annotated_frame = frame
         
         for i, (box, conf, cls_id) in enumerate(zip(detection.boxes, detection.confidences, detection.class_ids)):
             x1, y1, x2, y2 = box

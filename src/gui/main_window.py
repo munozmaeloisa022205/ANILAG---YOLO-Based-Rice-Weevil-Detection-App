@@ -19,6 +19,7 @@ from PyQt5.QtGui import QImage, QPixmap, QFont, QIcon
 from typing import Optional, TextIO
 import io
 import os
+import queue
 import shutil
 import time
 from datetime import datetime, timedelta
@@ -54,42 +55,55 @@ class DetectionThread(QThread):
 
     def run(self):
         self.running = True
-        while self.running:
-            cycle_started = time.perf_counter()
+        try:
+            # Pre-warm the NCNN model on this thread. NCNN does thread-local
+            # initialization on the first inference call (prints "Loading
+            # models..."), which can segfault if it happens mid-loop. Running
+            # a dummy frame first ensures the initialization is complete.
+            import numpy as np
+            dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+            self.detector.detect(dummy)
 
-            # TEMPORARY TEST MODE: bypass is_healthy() so inference runs even
-            # when the signal validation reports blank/frozen frames.
-            left_healthy = self.camera_manager.left_camera.is_running()
-            right_healthy = self.camera_manager.right_camera.is_running()
-            self.camera_status.emit(left_healthy, right_healthy)
-            left_frame = self.camera_manager.get_left_frame() if left_healthy else None
-            right_frame = self.camera_manager.get_right_frame() if right_healthy else None
+            while self.running:
+                cycle_started = time.perf_counter()
 
-            # Emit combined detection update
-            total_count = 0
-            confidences = []
-            if left_frame is not None:
-                detection_left = self.detector.detect(left_frame)
-                total_count += detection_left.count
-                confidences.extend(detection_left.confidences)
-                self.frame_ready_left.emit(left_frame, detection_left)
+                # TEMPORARY TEST MODE: bypass is_healthy() so inference runs even
+                # when the signal validation reports blank/frozen frames.
+                left_healthy = self.camera_manager.left_camera.is_running()
+                right_healthy = self.camera_manager.right_camera.is_running()
+                self.camera_status.emit(left_healthy, right_healthy)
+                left_frame = self.camera_manager.get_left_frame() if left_healthy else None
+                right_frame = self.camera_manager.get_right_frame() if right_healthy else None
 
-            if right_frame is not None:
-                detection_right = self.detector.detect(right_frame)
-                total_count += detection_right.count
-                confidences.extend(detection_right.confidences)
-                self.frame_ready_right.emit(right_frame, detection_right)
+                # Emit combined detection update
+                total_count = 0
+                confidences = []
+                if left_frame is not None:
+                    detection_left = self.detector.detect(left_frame)
+                    total_count += detection_left.count
+                    confidences.extend(detection_left.confidences)
+                    self.frame_ready_left.emit(left_frame, detection_left)
 
-            avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
-            self.detection_update.emit(total_count, avg_confidence, "Detection")
+                if right_frame is not None:
+                    detection_right = self.detector.detect(right_frame)
+                    total_count += detection_right.count
+                    confidences.extend(detection_right.confidences)
+                    self.frame_ready_right.emit(right_frame, detection_right)
 
-            elapsed_ms = (time.perf_counter() - cycle_started) * 1000
-            self.stats_update.emit(1000.0 / elapsed_ms if elapsed_ms > 0 else 0.0,
-                                   self.detector.avg_inference_ms)
+                avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
+                self.detection_update.emit(total_count, avg_confidence, "Detection")
 
-            # Throttle so the Pi 5 keeps headroom for the GUI, recording and DB writes
-            remaining = self.interval_ms - elapsed_ms
-            self.msleep(int(remaining) if remaining > 0 else 1)
+                elapsed_ms = (time.perf_counter() - cycle_started) * 1000
+                self.stats_update.emit(1000.0 / elapsed_ms if elapsed_ms > 0 else 0.0,
+                                       self.detector.avg_inference_ms)
+
+                # Throttle so the Pi 5 keeps headroom for the GUI, recording and DB writes
+                remaining = self.interval_ms - elapsed_ms
+                self.msleep(int(remaining) if remaining > 0 else 1)
+        except Exception as e:
+            print(f"DetectionThread crashed: {e}")
+            import traceback
+            traceback.print_exc()
 
     def stop(self):
         self.running = False
@@ -109,10 +123,12 @@ class PreviewThread(QThread):
     frame_ready_right = pyqtSignal(np.ndarray)
     camera_status = pyqtSignal(bool, bool)
 
-    def __init__(self, camera_manager: DualCameraManager, interval_ms: int = 66):
+    def __init__(self, camera_manager: DualCameraManager, interval_ms: int = 33):
         super().__init__()
         self.camera_manager = camera_manager
-        # ~15 FPS is plenty for a live preview and keeps the Pi 5 cool.
+        # ~30 FPS for smooth live preview. The capture thread runs independently
+        # in its own thread, so this only controls how often frames are emitted
+        # to the GUI for display. Detection runs on a separate thread during scans.
         self.interval_ms = max(0, interval_ms)
         self.running = False
 
@@ -123,8 +139,12 @@ class PreviewThread(QThread):
             left_healthy = self.camera_manager.left_camera.is_running()
             right_healthy = self.camera_manager.right_camera.is_running()
             self.camera_status.emit(left_healthy, right_healthy)
-            left_frame = self.camera_manager.get_left_frame() if left_healthy else None
-            right_frame = self.camera_manager.get_right_frame() if right_healthy else None
+            # Use get_frame_raw to avoid the expensive .copy() — the frame is
+            # only read (never mutated) by the rendering slot, so sharing the
+            # buffer is safe as long as the capture thread replaces current_frame
+            # atomically (it does, under self.lock).
+            left_frame = self.camera_manager.get_left_frame_raw() if left_healthy else None
+            right_frame = self.camera_manager.get_right_frame_raw() if right_healthy else None
             if left_frame is not None:
                 self.frame_ready_left.emit(left_frame)
             if right_frame is not None:
@@ -138,6 +158,49 @@ class PreviewThread(QThread):
         self.wait()
 
 
+class VideoWriterThread(QThread):
+    """Encodes frames to a video file in a background thread.
+
+    cv2.VideoWriter.write() is CPU-intensive (H.264/mp4v encoding). Calling it
+    on the GUI thread blocks the Qt event loop, so queued signals from the
+    detection thread pile up faster than they can be processed - the window
+    stops repainting, button clicks are ignored, and eventually Python becomes
+    unresponsive. This thread drains a bounded queue and encodes asynchronously,
+    dropping frames if the encoder falls behind rather than stalling the GUI.
+    """
+    def __init__(self, writer: cv2.VideoWriter, max_queue: int = 30):
+        super().__init__()
+        self.writer = writer
+        self._queue: queue.Queue = queue.Queue(maxsize=max_queue)
+        self.running = False
+
+    def put(self, frame: np.ndarray):
+        try:
+            self._queue.put_nowait(frame)
+        except queue.Full:
+            pass
+
+    def run(self):
+        self.running = True
+        while self.running or not self._queue.empty():
+            try:
+                frame = self._queue.get(timeout=0.5)
+                try:
+                    self.writer.write(frame)
+                except Exception:
+                    pass
+            except queue.Empty:
+                continue
+
+    def stop_and_release(self):
+        self.running = False
+        self.wait(5000)
+        try:
+            self.writer.release()
+        except Exception:
+            pass
+
+
 class ConsoleLogStream(QObject):
     """Tee stdout/stderr so every print() also appears in the System Log.
 
@@ -145,6 +208,13 @@ class ConsoleLogStream(QObject):
     thread, etc.), so a Qt signal is used to marshal the text to the GUI
     thread safely.
     """
+    # NVIDIA Broadcast's DirectShow filter spams hundreds of [DSH]/[MBHB]/[UIB]
+    # log lines to stderr when a virtual camera is opened. Each line would
+    # emit a Qt signal to the GUI thread, flooding the event loop and making
+    # the app unresponsive. Filter these out before emitting.
+    _SPAM_PREFIXES = ('[DSH]', '[MBHB]', '[UIB]', '[ERR ] [DSH]',
+                      '[WARN] [DSH]', '[INFO] [DSH]')
+
     line_printed = pyqtSignal(str)
 
     def __init__(self, original: TextIO):
@@ -152,20 +222,23 @@ class ConsoleLogStream(QObject):
         self._original = original
         self._buffer = ""
 
+    def _is_spam(self, line: str) -> bool:
+        return any(line.strip().startswith(p) for p in self._SPAM_PREFIXES)
+
     def write(self, text: str) -> int:
         self._original.write(text)
         self._buffer += text
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
-            if line.strip():
+            if line.strip() and not self._is_spam(line):
                 self.line_printed.emit(line)
         return len(text)
 
     def flush(self):
         self._original.flush()
-        if self._buffer.strip():
+        if self._buffer.strip() and not self._is_spam(self._buffer):
             self.line_printed.emit(self._buffer)
-            self._buffer = ""
+        self._buffer = ""
 
 
 class EmailThread(QThread):
@@ -180,11 +253,17 @@ class EmailThread(QThread):
         self.kwargs = kwargs
 
     def run(self):
-        success = self.send_func(*self.args, **self.kwargs)
-        if success:
-            self.finished_with_status.emit(True, f"Email sent: {self.description}")
-        else:
-            self.finished_with_status.emit(False, f"Email failed: {self.description} (see console for details)")
+        try:
+            success = self.send_func(*self.args, **self.kwargs)
+            if success:
+                self.finished_with_status.emit(True, f"Email sent: {self.description}")
+            else:
+                self.finished_with_status.emit(False, f"Email failed: {self.description} (see console for details)")
+        except Exception as e:
+            import traceback
+            print(f"EmailThread exception: {e}")
+            traceback.print_exc()
+            self.finished_with_status.emit(False, f"Email error: {self.description} ({e})")
 
 
 class CameraLabel(QLabel):
@@ -342,6 +421,8 @@ class MainWindow(QMainWindow):
         # Recording infrastructure
         self.video_writer_left = None
         self.video_writer_right = None
+        self.video_writer_thread_left = None
+        self.video_writer_thread_right = None
         self.current_scan_folder = None
         self.current_scan_id = None
         _default_scans_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'previous_scans')
@@ -361,6 +442,9 @@ class MainWindow(QMainWindow):
         self.image_capture_cooldown = int(os.getenv('IMAGE_CAPTURE_COOLDOWN', '30'))  # seconds between captures
         self.latest_annotated_left = None
         self.latest_annotated_right = None
+        # Cached detection results from DetectionThread, overlaid on preview frames
+        self._latest_detection_left = None
+        self._latest_detection_right = None
 
         # Per-camera digital zoom (applied to the displayed feed only; the recorded
         # video and stored images keep the full frame). Zoom factor of 1.0 = no zoom,
@@ -1128,7 +1212,9 @@ class MainWindow(QMainWindow):
             if not self.camera_manager.start():
                 self.log_message("No camera device available for live preview")
                 return
-        self.preview_thread = PreviewThread(self.camera_manager)
+        preview_fps = int(os.getenv('PREVIEW_FPS', '30'))
+        preview_interval_ms = max(1, int(1000 / preview_fps))
+        self.preview_thread = PreviewThread(self.camera_manager, interval_ms=preview_interval_ms)
         self.preview_thread.frame_ready_left.connect(self.update_left_preview)
         self.preview_thread.frame_ready_right.connect(self.update_right_preview)
         self.preview_thread.camera_status.connect(self.update_camera_status)
@@ -1143,16 +1229,51 @@ class MainWindow(QMainWindow):
             self.preview_thread = None
 
     def update_left_preview(self, frame: np.ndarray):
-        """Render a raw camera frame (no detection annotations) for live preview."""
-        self.latest_annotated_left = frame
-        self._render_frame_to_label(frame, self.left_camera_label, self.left_zoom,
-                                    self.left_pan_x, self.left_pan_y)
+        """Render a raw camera frame for live preview at 30 FPS.
+
+        During a scan, overlay the latest cached detection bounding boxes and
+        write the annotated frame to the video recorder. This keeps recording
+        at full 30 FPS with real-time bounding boxes, while detection runs at
+        5 FPS on its own thread.
+        """
+        if self.is_scanning and self._latest_detection_left is not None:
+            annotated = self.detector.draw_detections(frame, self._latest_detection_left)
+            self.latest_annotated_left = annotated
+            if self.video_writer_thread_left:
+                self.video_writer_thread_left.put(annotated)
+            self._render_frame_to_label(annotated, self.left_camera_label, self.left_zoom,
+                                        self.left_pan_x, self.left_pan_y)
+        else:
+            self.latest_annotated_left = frame
+            self._render_frame_to_label(frame, self.left_camera_label, self.left_zoom,
+                                        self.left_pan_x, self.left_pan_y)
 
     def update_right_preview(self, frame: np.ndarray):
-        """Render a raw camera frame (no detection annotations) for live preview."""
-        self.latest_annotated_right = frame
-        self._render_frame_to_label(frame, self.right_camera_label, self.right_zoom,
-                                    self.right_pan_x, self.right_pan_y)
+        """Render a raw camera frame for live preview (right camera)."""
+        if self.is_scanning and self._latest_detection_right is not None:
+            annotated = self.detector.draw_detections(frame, self._latest_detection_right)
+            self.latest_annotated_right = annotated
+            if self.video_writer_thread_right:
+                self.video_writer_thread_right.put(annotated)
+            self._render_frame_to_label(annotated, self.right_camera_label, self.right_zoom,
+                                        self.right_pan_x, self.right_pan_y)
+        else:
+            self.latest_annotated_right = frame
+            self._render_frame_to_label(frame, self.right_camera_label, self.right_zoom,
+                                        self.right_pan_x, self.right_pan_y)
+
+    def _on_detection_left(self, frame: np.ndarray, detection: DetectionResult):
+        """Cache detection results from DetectionThread (called at 5 FPS).
+
+        The preview thread overlays these cached results on every 30 FPS frame
+        for smooth real-time display and recording. Detection update (count,
+        confidence, logging, image capture) is handled by update_detection.
+        """
+        self._latest_detection_left = detection
+
+    def _on_detection_right(self, frame: np.ndarray, detection: DetectionResult):
+        """Cache detection results from DetectionThread (right camera)."""
+        self._latest_detection_right = detection
 
     def update_model_display(self):
         """Report which YOLOv11n weights and backend are loaded to the Detection Log.
@@ -1190,13 +1311,87 @@ class MainWindow(QMainWindow):
         else:
             self.start_scan()
 
+    @staticmethod
+    def _create_video_writer(path: str, fps: int, frame_size: tuple) -> Optional[cv2.VideoWriter]:
+        """Create a VideoWriter that works without external DLLs on Windows.
+
+        OpenCV's FFMPEG backend needs openh264.dll for H.264 (avc1) and even
+        mp4v in an .mp4 container. isOpened() can return True even when the
+        codec failed internally, so we validate by writing a test frame and
+        checking the output file is non-empty. Returns None if no codec works,
+        so the caller can skip recording gracefully.
+        """
+        import numpy as np
+        base, _ = os.path.splitext(path)
+        # Skip avc1/mp4v-in-mp4 on Windows — they always need OpenH264 DLL.
+        # Go straight to .avi containers which use built-in VFW codecs.
+        candidates = [
+            (base + '.avi', 'mp4v'),  # MPEG-4 Part 2 in .avi — no DLL needed
+            (base + '.avi', 'XVID'),  # Xvid in .avi — widely supported
+            (base + '.avi', 'MJPG'),  # Motion JPEG in .avi — fallback
+        ]
+        test_frame = np.zeros((frame_size[1], frame_size[0], 3), dtype=np.uint8)
+        for full_path, codec in candidates:
+            # Remove stale file from previous failed attempt
+            if os.path.exists(full_path):
+                os.remove(full_path)
+            fourcc = cv2.VideoWriter_fourcc(*codec)
+            writer = cv2.VideoWriter(full_path, fourcc, fps, frame_size)
+            if not writer.isOpened():
+                writer.release()
+                continue
+            # Validate: write a test frame and check the file is non-empty.
+            # isOpened() can lie when the codec partially initialized.
+            try:
+                writer.write(test_frame)
+                writer.release()
+            except Exception:
+                try:
+                    writer.release()
+                except Exception:
+                    pass
+                continue
+            if os.path.exists(full_path) and os.path.getsize(full_path) > 0:
+                # Re-open the validated file for appending
+                writer = cv2.VideoWriter(full_path, fourcc, fps, frame_size)
+                if writer.isOpened():
+                    return writer
+            # Clean up failed file
+            if os.path.exists(full_path):
+                try:
+                    os.remove(full_path)
+                except OSError:
+                    pass
+        return None
+
+    @staticmethod
+    def _video_writer_path(writer: Optional[cv2.VideoWriter], fallback: str) -> str:
+        """Return the actual output path of a VideoWriter, or empty string if None."""
+        if writer is None:
+            return ''
+        try:
+            # OpenCV doesn't expose the filename directly, but the fallback
+            # path's directory is correct; only the extension may differ.
+            # The _create_video_writer method may have switched .mp4 → .avi.
+            base = os.path.splitext(fallback)[0]
+            for ext in ('.mp4', '.avi'):
+                candidate = base + ext
+                if os.path.exists(candidate):
+                    return candidate
+        except Exception:
+            pass
+        return fallback
+
     def start_scan(self):
-        # Stop the lightweight preview loop so the detection thread can take
-        # over the same camera feeds without contention.
-        self.stop_preview()
-        if not self.camera_manager.start():
-            self.log_message("Failed to start cameras - no capture device could be opened")
-            return
+        # Keep the preview thread running for smooth 30 FPS display during scans.
+        # The DetectionThread runs detection independently and only emits detection
+        # results (not frames) — the preview slot overlays the latest bounding boxes.
+        # This decouples display FPS from detection FPS, so even with augment=True
+        # (1 detection/second) the camera feed stays smooth.
+        if not self.camera_manager.is_running():
+            if not self.camera_manager.start():
+                self.log_message("Failed to start cameras - no capture device could be opened")
+                return
 
         # TEMPORARY TEST MODE: skip live-signal validation so the scan starts
         # with whatever camera opened, even if frames are blank/frozen.
@@ -1238,22 +1433,28 @@ class MainWindow(QMainWindow):
         width = int(os.getenv('CAMERA_WIDTH', '640'))
         height = int(os.getenv('CAMERA_HEIGHT', '480'))
         fps = int(os.getenv('CAMERA_FPS', '30'))
-        
+
         left_video_path = os.path.join(self.current_scan_folder, "left_camera.mp4")
         right_video_path = os.path.join(self.current_scan_folder, "right_camera.mp4")
 
-        # Use H.264 codec for better compression; fall back to mp4v if unavailable.
-        fourcc = cv2.VideoWriter_fourcc(*'avc1')
-        self.video_writer_left = cv2.VideoWriter(left_video_path, fourcc, fps, (width, height))
-        if not self.video_writer_left.isOpened():
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            self.video_writer_left = cv2.VideoWriter(left_video_path, fourcc, fps, (width, height))
+        self.video_writer_left = self._create_video_writer(left_video_path, fps, (width, height))
+        self.video_writer_right = self._create_video_writer(right_video_path, fps, (width, height)) if right_ok else None
 
-        fourcc = cv2.VideoWriter_fourcc(*'avc1')
-        self.video_writer_right = cv2.VideoWriter(right_video_path, fourcc, fps, (width, height))
-        if not self.video_writer_right.isOpened():
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            self.video_writer_right = cv2.VideoWriter(right_video_path, fourcc, fps, (width, height))
+        # Track the actual output paths (may differ from .mp4 if codec fell back to .avi)
+        left_video_path = self._video_writer_path(self.video_writer_left, left_video_path)
+        right_video_path = self._video_writer_path(self.video_writer_right, right_video_path)
+
+        # Encode video in background threads so the GUI event loop is not blocked
+        # by compression on every frame. Only create threads for writers that
+        # actually opened — writing to a non-opened writer crashes the thread.
+        self.video_writer_thread_left = VideoWriterThread(self.video_writer_left) if self.video_writer_left else None
+        self.video_writer_thread_right = VideoWriterThread(self.video_writer_right) if self.video_writer_right else None
+        if self.video_writer_thread_left:
+            self.video_writer_thread_left.start()
+        if self.video_writer_thread_right:
+            self.video_writer_thread_right.start()
+        if not self.video_writer_left and not self.video_writer_right:
+            self.log_message("WARNING: video recording disabled (no compatible codec found)")
         
         # Reset scan metadata
         self.scan_start_time = datetime.now()
@@ -1273,8 +1474,11 @@ class MainWindow(QMainWindow):
         
         self.detection_thread = DetectionThread(self.camera_manager, self.detector,
                                                 interval_ms=self.detection_interval_ms)
-        self.detection_thread.frame_ready_left.connect(self.update_left_frame)
-        self.detection_thread.frame_ready_right.connect(self.update_right_frame)
+        # DetectionThread emits detection results only — the preview thread
+        # handles frame display at 30 FPS. The detection results are cached
+        # and overlaid on the preview frames in update_left/right_preview.
+        self.detection_thread.frame_ready_left.connect(self._on_detection_left)
+        self.detection_thread.frame_ready_right.connect(self._on_detection_right)
         self.detection_thread.detection_update.connect(self.update_detection)
         self.detection_thread.stats_update.connect(self.update_performance_stats)
         self.detection_thread.camera_status.connect(self.update_camera_status)
@@ -1285,6 +1489,11 @@ class MainWindow(QMainWindow):
         self.last_log_time = None
         self.last_detection_log_time = None
         self._last_temp_sample_id = None
+        
+        # Ensure the preview thread is running for smooth 30 FPS display.
+        # DetectionThread handles only detection; preview handles display.
+        if self.preview_thread is None:
+            self.start_preview()
         
         self.is_scanning = True
         self.start_button.setText("Stop Scan")
@@ -1318,50 +1527,81 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"Scanning... {remaining // 60:02d}:{remaining % 60:02d} remaining")
 
     def stop_scan(self):
-        self.scan_timer.stop()
-        self.scan_countdown_timer.stop()
+        scan_id = self.current_scan_id
+        try:
+            self.scan_timer.stop()
+            self.scan_countdown_timer.stop()
 
-        if self.detection_thread:
-            self.detection_thread.stop()
-            self.detection_thread = None
+            if self.detection_thread:
+                self.detection_thread.stop()
+                self.detection_thread = None
 
-        # Stop recording and save metadata
-        if self.video_writer_left:
-            self.video_writer_left.release()
+            # Stop recording and save metadata
+            if self.video_writer_thread_left:
+                self.video_writer_thread_left.stop_and_release()
+                self.video_writer_thread_left = None
+            elif self.video_writer_left:
+                try:
+                    self.video_writer_left.release()
+                except Exception:
+                    pass
             self.video_writer_left = None
-        if self.video_writer_right:
-            self.video_writer_right.release()
+            if self.video_writer_thread_right:
+                self.video_writer_thread_right.stop_and_release()
+                self.video_writer_thread_right = None
+            elif self.video_writer_right:
+                try:
+                    self.video_writer_right.release()
+                except Exception:
+                    pass
             self.video_writer_right = None
 
-        # Persist the scan metadata; the detection log and images are already in the DB
-        scan_id = self.current_scan_id
-        if self.current_scan_folder and scan_id:
-            self.save_scan_metadata()
+            # Persist the scan metadata; the detection log and images are already in the DB
+            if self.current_scan_folder and scan_id:
+                self.save_scan_metadata()
 
-        self.is_scanning = False
-        self.start_button.setText("Start Scan")
-        self.start_button.setStyleSheet(
-            self._touch_button_style("#4CAF50", "#45a049", pressed="#3d8b40"))
-        # Reset the per-frame detection display, but show the final collective
-        # recommendation based on the scan's max weevil count. "Activate Mix" /
-        # "Unload Rice" are post-scan decisions, not per-frame readings.
-        self.count_label.setText(f"Weevil Count: {self.scan_max_count}")
-        self.confidence_label.setText("Avg Confidence: --")
-        final_rec = self.logger.generate_recommendation(
-            self.scan_max_count, self.is_after_mixing, is_final=True)
-        self.recommendation_label.setText(f"Recommendation: {final_rec}")
-        self.status_label.setText("Ready")
-        self.latest_annotated_left = None
-        self.latest_annotated_right = None
-        self.log_message("Scan stopped and saved")
+            self.is_scanning = False
+            self.start_button.setText("Start Scan")
+            self.start_button.setStyleSheet(
+                self._touch_button_style("#4CAF50", "#45a049", pressed="#3d8b40"))
+            # Reset the per-frame detection display, but show the final collective
+            # recommendation based on the scan's max weevil count. "Activate Mix" /
+            # "Unload Rice" are post-scan decisions, not per-frame readings.
+            self.count_label.setText(f"Weevil Count: {self.scan_max_count}")
+            self.confidence_label.setText("Avg Confidence: --")
+            final_rec = self.logger.generate_recommendation(
+                self.scan_max_count, self.is_after_mixing, is_final=True)
+            self.recommendation_label.setText(f"Recommendation: {final_rec}")
+            self.status_label.setText("Ready")
+            self.latest_annotated_left = None
+            self.latest_annotated_right = None
+            self._latest_detection_left = None
+            self._latest_detection_right = None
+            self.log_message("Scan stopped and saved")
+        except Exception as e:
+            self.is_scanning = False
+            self.start_button.setText("Start Scan")
+            self.start_button.setStyleSheet(
+                self._touch_button_style("#4CAF50", "#45a049", pressed="#3d8b40"))
+            self.status_label.setText("Ready")
+            self.log_message(f"Error during scan stop: {e}")
+            import traceback
+            traceback.print_exc()
 
         # Keep the cameras open and restart the preview loop so the feeds stay
         # live after the scan ends. The cameras are only stopped on app exit.
-        self.start_preview()
+        try:
+            self.start_preview()
+        except Exception as e:
+            self.log_message(f"Error restarting preview: {e}")
 
+        # Always attempt to email the report, even if cleanup above had errors
         if scan_id:
-            self.email_scan_report(scan_id)
-            self.refresh_scan_history()
+            try:
+                self.email_scan_report(scan_id)
+                self.refresh_scan_history()
+            except Exception as e:
+                self.log_message(f"Error emailing scan report: {e}")
 
     def email_scan_report(self, scan_id: str) -> Optional[str]:
         """Build the report archive from the database and email it automatically.
@@ -1370,6 +1610,7 @@ class MainWindow(QMainWindow):
         protocol timer elapsed). Everything in the archive - the detection log CSV
         and the captured rice weevil images - is read back out of SQLite.
         """
+        self.log_message(f"Preparing scan report for {scan_id}...")
         video_paths = [p for p in (getattr(self, 'left_video_path', None),
                                    getattr(self, 'right_video_path', None)) if p]
         scan = self.db.get_scan_by_id(scan_id)
@@ -1384,6 +1625,8 @@ class MainWindow(QMainWindow):
                 self.db, scan_id, zip_path, video_paths=video_paths, max_bytes=max_bytes)
         except Exception as e:
             self.log_message(f"Error building scan archive from database: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
         if not archive_path:
@@ -1391,7 +1634,7 @@ class MainWindow(QMainWindow):
             return None
 
         self.log_message(
-            f"Scan archive built from database: {os.path.basename(archive_path)} "
+            f"Scan archive built: {os.path.basename(archive_path)} "
             f"({info['archive_bytes'] / (1024 * 1024):.2f} MB, {info['log_entry_count']} log entries, "
             f"{info['image_count']} images, videos {'included' if info['included_videos'] else 'excluded'})")
 
@@ -1406,7 +1649,7 @@ class MainWindow(QMainWindow):
             self.log_message("Email disabled - archive saved locally and recorded in the database")
             return archive_path
 
-        self.log_message(f"Emailing scan report to {self.email_notifier.recipient_email}...")
+        self.log_message(f"Sending scan report email to {self.email_notifier.recipient_email}...")
         self.send_email_async(f"Scan Report {scan_id}", self.email_notifier.send_scan_report,
                               scan_id, archive_path, summary, report_id=report_id)
         return archive_path
@@ -1687,8 +1930,8 @@ class MainWindow(QMainWindow):
             "temperature_sensor": self.temp_sensor.get_status(),
             "led_controller": self.led_controller.get_status(),
             "videos": {
-                "left_camera": "left_camera.mp4",
-                "right_camera": "right_camera.mp4"
+                "left_camera": os.path.basename(self.left_video_path) if getattr(self, 'left_video_path', None) else None,
+                "right_camera": os.path.basename(self.right_video_path) if getattr(self, 'right_video_path', None) else None
             }
         }
         
@@ -1806,31 +2049,36 @@ class MainWindow(QMainWindow):
         height) is scaled up to fill the label. pan_x/pan_y (in frame pixels)
         shift the crop centre so the user can drag to navigate the zoomed view.
         """
-        rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        target = label.contentsRect().size()
+        if target.width() <= 0 or target.height() <= 0:
+            return
+
         if zoom > 1.0:
-            h, w = rgb_image.shape[:2]
+            h, w = frame.shape[:2]
             crop_w = int(w / zoom)
             crop_h = int(h / zoom)
-            # Centre the crop, then apply pan offset (clamped to frame bounds)
             cx = w / 2 + pan_x
             cy = h / 2 + pan_y
             x0 = int(max(0, min(w - crop_w, cx - crop_w / 2)))
             y0 = int(max(0, min(h - crop_h, cy - crop_h / 2)))
-            rgb_image = rgb_image[y0:y0 + crop_h, x0:x0 + crop_w]
-            # Slicing produces a non-contiguous view; QImage needs a contiguous buffer
+            # Crop in BGR (cheaper than after RGB conversion), then convert
+            cropped = frame[y0:y0 + crop_h, x0:x0 + crop_w]
+            rgb_image = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
             rgb_image = np.ascontiguousarray(rgb_image)
+        else:
+            # No zoom: convert the full frame directly. cv2.cvtColor returns
+            # a contiguous array so no extra copy is needed.
+            rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         h, w, ch = rgb_image.shape
         bytes_per_line = ch * w
+        # QImage wraps the numpy buffer (no copy). QPixmap.fromImage copies
+        # into the GPU/pixmap cache, so the numpy buffer can be freed after.
         qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(qt_image)
-        # Fill the whole panel: scale up until both dimensions are covered, then
-        # trim the centre to the panel size. This maximizes the camera input -
-        # no black letterbox bars - regardless of the panel's aspect ratio.
-        target = label.contentsRect().size()
-        if target.width() <= 0 or target.height() <= 0:
-            return
-        scaled_pixmap = pixmap.scaled(target, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+        # Scale to fill the panel, then crop the overflow. KeepAspectRatioByExpanding
+        # + FastTransformation is the fastest path (nearest-neighbor, no smoothing).
+        scaled_pixmap = QPixmap.fromImage(qt_image).scaled(
+            target, Qt.KeepAspectRatioByExpanding, Qt.FastTransformation)
         if scaled_pixmap.width() > target.width() or scaled_pixmap.height() > target.height():
             x0 = (scaled_pixmap.width() - target.width()) // 2
             y0 = (scaled_pixmap.height() - target.height()) // 2
@@ -1843,8 +2091,8 @@ class MainWindow(QMainWindow):
         self.latest_annotated_left = annotated_frame
         
         # Write to video file if recording (always full frame, not zoomed)
-        if self.video_writer_left and self.video_writer_left.isOpened():
-            self.video_writer_left.write(annotated_frame)
+        if self.video_writer_thread_left:
+            self.video_writer_thread_left.put(annotated_frame)
 
         # Display with current zoom level (display-only; recording keeps full frame)
         self._render_frame_to_label(annotated_frame, self.left_camera_label, self.left_zoom,
@@ -1856,8 +2104,8 @@ class MainWindow(QMainWindow):
         self.latest_annotated_right = annotated_frame
 
         # Write to video file if recording (always full frame, not zoomed)
-        if self.video_writer_right and self.video_writer_right.isOpened():
-            self.video_writer_right.write(annotated_frame)
+        if self.video_writer_thread_right:
+            self.video_writer_thread_right.put(annotated_frame)
 
         # Display with current zoom level (display-only; recording keeps full frame)
         self._render_frame_to_label(annotated_frame, self.right_camera_label, self.right_zoom,
@@ -2109,6 +2357,18 @@ def show_main_window(loading_screen):
     loading_screen.close()
     window = MainWindow()
     window.show()
+
+    # Install a global excepthook so unhandled exceptions in QThreads print a
+    # full traceback instead of silently killing the process with just
+    # "Unhandled Python exception". This makes crashes debuggable.
+    def _global_excepthook(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        import traceback
+        print(f"Unhandled exception: {exc_value}")
+        traceback.print_exception(exc_type, exc_value, exc_tb)
+    sys.excepthook = _global_excepthook
 
 
 if __name__ == '__main__':

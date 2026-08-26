@@ -40,6 +40,7 @@ class EmailNotifier:
             print("Email notification disabled")
             return False
 
+        print(f"send_email: subject='{subject}', attachments={len(attachments or [])}")
         try:
             msg = MIMEMultipart()
             msg['From'] = self.sender_email
@@ -55,6 +56,7 @@ class EmailNotifier:
                 if size_mb > self.max_attachment_mb:
                     print(f"Attachment too large ({size_mb:.1f} MB > {self.max_attachment_mb} MB), skipping: {path}")
                     continue
+                print(f"Attaching: {os.path.basename(path)} ({size_mb:.2f} MB)")
                 part = MIMEBase('application', 'octet-stream')
                 with open(path, 'rb') as f:
                     part.set_payload(f.read())
@@ -63,14 +65,17 @@ class EmailNotifier:
                                 f'attachment; filename="{os.path.basename(path)}"')
                 msg.attach(part)
 
+            print(f"Connecting to SMTP {self.smtp_server}:{self.smtp_port}...")
             with smtplib.SMTP(self.smtp_server, self.smtp_port, timeout=60) as server:
                 server.ehlo()
                 server.starttls()
                 server.ehlo()
+                print(f"Logging in as {self.sender_email}...")
                 server.login(self.sender_email, self.sender_password)
+                print("Sending message...")
                 server.send_message(msg, from_addr=self.sender_email, to_addrs=self.recipients)
 
-            print(f"Email sent: {subject}")
+            print(f"Email sent successfully: {subject}")
             return True
         except smtplib.SMTPAuthenticationError as e:
             print(f"Email authentication failed: {e}. "

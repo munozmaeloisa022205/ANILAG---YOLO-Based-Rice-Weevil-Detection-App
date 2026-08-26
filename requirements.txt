@@ -1,6 +1,22 @@
-PyQt5==5.15.10
+# GUI.
+# PyQt5 publishes wheels for Windows, macOS and x86_64 Linux only - there is NO
+# aarch64 wheel. On the Raspberry Pi 5 pip therefore tries to build Qt/sip from
+# source and fails, so install it from apt instead and create the venv with
+# --system-site-packages (start.sh already does this):
+#     sudo apt install -y python3-pyqt5
+PyQt5==5.15.10; platform_machine != "aarch64" and platform_machine != "armv7l"
+
 ultralytics>=8.3.0
-opencv-python==4.9.0.80
+
+# OpenCV.
+# The regular opencv-python wheel bundles its own copy of the Qt libraries.
+# Loaded next to the apt PyQt5 on the Pi that puts two different Qt5 builds in
+# one process and the app aborts with "Cannot mix incompatible Qt library" or a
+# failed xcb platform plugin. The headless wheel simply omits the unused
+# highgui module (all display goes through PyQt5, this code never calls
+# cv2.imshow) and is otherwise identical.
+opencv-python-headless==4.9.0.80; platform_machine == "aarch64" or platform_machine == "armv7l"
+opencv-python==4.9.0.80; platform_machine != "aarch64" and platform_machine != "armv7l"
 numpy==1.26.4
 pillow==10.3.0
 pyserial==3.5

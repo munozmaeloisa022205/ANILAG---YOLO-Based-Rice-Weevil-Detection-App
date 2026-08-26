@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Anilag
+Comment=Rice Weevil Detection and Control System
+Exec=/home/pi/anilag/scripts/anilag-autostart.sh
+Icon=/home/pi/anilag/assets/logo.png
+Terminal=false
+Categories=Science;Education;
+StartupNotify=true
+X-GNOME-Autostart-enabled=true
