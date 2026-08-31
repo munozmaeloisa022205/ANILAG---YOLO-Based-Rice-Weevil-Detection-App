@@ -20,6 +20,10 @@ ultralytics>=8.3.0
 # 4.11.0.86 is the first release with cp313 wheels (Python 3.13 support was
 # added in that build); 4.9.0.80 has none and pip would try to compile OpenCV
 # from source on Python 3.13.
+# NOTE: ultralytics hard-depends on the regular opencv-python and pip does NOT
+# treat the headless wheel as satisfying it, so on the Pi pip installs
+# opencv-python anyway. start.sh uninstalls it again after the install step -
+# if you install manually on the Pi, run: pip uninstall -y opencv-python
 opencv-python-headless>=4.11.0.86; platform_machine == "aarch64" or platform_machine == "armv7l"
 opencv-python>=4.11.0.86; platform_machine != "aarch64" and platform_machine != "armv7l"
 # numpy 1.26.x has no cp313 wheels (Python 3.13 support landed in numpy 2.1.0).

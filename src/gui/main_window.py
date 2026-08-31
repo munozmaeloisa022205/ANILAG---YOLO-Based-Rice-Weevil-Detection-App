@@ -9,13 +9,13 @@ import numpy as np
 # is harmless everywhere else, including the Raspberry Pi. Do not reorder.
 from src.detection.yolov11_detector import YOLOv11Detector, DetectionResult
 
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QTextEdit, QGroupBox,
                              QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
                              QListWidget, QListWidgetItem, QSplitter, QSizePolicy,
                              QMessageBox)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QObject
-from PyQt5.QtGui import QImage, QPixmap, QFont, QIcon
+from PyQt5.QtGui import QImage, QPixmap, QFont, QIcon, QTextCursor
 from typing import Optional, TextIO
 import io
 import os
@@ -341,6 +341,10 @@ class MainWindow(QMainWindow):
     TOUCH_ROW_HEIGHT = 44
     # Scrollbars are dragged by finger, so they are far wider than the desktop default.
     TOUCH_SCROLLBAR_SIZE = 22
+    # Maximum lines kept in the System Log. QTextEdit.append() is O(n) in the
+    # document size, so an unbounded log makes every append slower until the GUI
+    # hangs. Trimming to this many blocks keeps append() effectively O(1).
+    MAX_LOG_LINES = 1000
     # Group boxes in the feed tabs: a short title margin keeps the controls strip
     # and the info column from eating vertical space on the 600px-tall screen.
     COMPACT_GROUP_STYLE = (
@@ -463,6 +467,17 @@ class MainWindow(QMainWindow):
         
         # Scan protocol: each scan runs for a fixed duration, then auto-stops and emails the report
         self.scan_duration_seconds = int(os.getenv('SCAN_DURATION_SECONDS', '180'))
+        # Heating Timer: a 3-minute safety timer shown in the camera feed tabs.
+        # It auto-starts when the DS18B20 reads above the threshold so the rig
+        # is not left heating unattended. The user can stop it early, but is
+        # warned first because interrupting a heating cycle may under-heat it.
+        self.heating_timer_duration_seconds = int(os.getenv('HEATING_TIMER_SECONDS', '180'))
+        self.heating_temp_threshold_c = float(os.getenv('HEATING_TEMP_THRESHOLD_C', '30.0'))
+        self.heating_remaining_seconds = self.heating_timer_duration_seconds
+        # Re-arms only after the temperature returns to a safe level, so the
+        # timer fires once per overheat event instead of restarting immediately
+        # on completion while still hot.
+        self._heating_auto_armed = False
         self.scan_images_dir = None
         self.email_threads = []
         # Sparse baseline log interval - guarantees a scan always has log rows, even when
@@ -485,7 +500,16 @@ class MainWindow(QMainWindow):
         # Setup UI
         self.init_ui()
         self.initialize_components()
-        
+
+        # Heating Timer - fires once when the 3-minute heating cycle completes.
+        # Set up before the temperature timer because update_temperature() can
+        # auto-start the heating timer on its very first call.
+        self.heating_timer = QTimer()
+        self.heating_timer.setSingleShot(True)
+        self.heating_timer.timeout.connect(self.on_heating_timer_elapsed)
+        self.heating_countdown_timer = QTimer()
+        self.heating_countdown_timer.timeout.connect(self.update_heating_countdown)
+
         # Setup temperature update timer
         self.temp_timer = QTimer()
         self.temp_timer.timeout.connect(self.update_temperature)
@@ -849,36 +873,76 @@ class MainWindow(QMainWindow):
         scan_layout = QHBoxLayout()
         scan_layout.setContentsMargins(6, 4, 6, 4)
         scan_layout.setSpacing(4)
-        
+
         self.start_button = self._make_touch_button(
             "Start Scan", "#4CAF50", "#45a049", self.toggle_scan, pressed="#3d8b40")
+        # Expand to fill the Scan Controls group so the button is as wide as the
+        # Heating Timer group beside it, balancing the two halves of the strip.
+        self.start_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         scan_layout.addWidget(self.start_button)
 
         scan_group.setLayout(scan_layout)
-        controls_layout.addWidget(scan_group, stretch=2)
-        
-        # LED controls beside the scan controls
-        led_group = QGroupBox("LED Controls")
-        led_group.setStyleSheet(self.COMPACT_GROUP_STYLE)
-        led_layout = QHBoxLayout()
-        led_layout.setContentsMargins(6, 4, 6, 4)
-        led_layout.setSpacing(4)
-        
-        self.red_light_button = self._make_touch_button(
-            "Red Light", "#f44336", "#d32f2f", self.set_red_light, pressed="#b71c1c")
-        led_layout.addWidget(self.red_light_button)
-        
-        self.white_light_button = self._make_touch_button(
-            "White Light", "#ffffff", "#e0e0e0", self.set_white_light,
-            pressed="#cccccc", color="black", border="2px solid #333")
-        led_layout.addWidget(self.white_light_button)
-        
-        self.led_off_button = self._make_touch_button(
-            "LEDs Off", "#333333", "#555555", self.set_leds_off, pressed="#111111")
-        led_layout.addWidget(self.led_off_button)
-        
-        led_group.setLayout(led_layout)
-        controls_layout.addWidget(led_group, stretch=5)
+        controls_layout.addWidget(scan_group, stretch=1)
+
+        # Heating Timer beside the scan controls. Shows an enlarged countdown,
+        # a spinbox to change the duration (default 3 minutes), and a single
+        # Start/Stop button. Auto-starts when the temperature exceeds the
+        # threshold (see update_temperature); the user can stop it early but is
+        # warned first.
+        heating_group = QGroupBox("Heating Timer")
+        heating_group.setStyleSheet(self.COMPACT_GROUP_STYLE)
+        heating_layout = QHBoxLayout()
+        heating_layout.setContentsMargins(6, 4, 6, 4)
+        heating_layout.setSpacing(6)
+
+        # Minutes selector - up/down arrow buttons stacked vertically. The
+        # current value is shown only on the countdown display to the right, so
+        # there is no redundant number here. Default 3 minutes, adjustable 1-60.
+        # Disabled while the timer runs so a mid-cycle change cannot desync the
+        # countdown from the single-shot QTimer.
+        arrow_style = (
+            "QPushButton { background-color: #ffe0b2; color: #e65100; "
+            "font-size: 16px; font-weight: bold; border: 1px solid #ffb74d; "
+            "border-radius: 4px; padding: 0px; }"
+            "QPushButton:disabled { background-color: #f5f5f5; color: #bbb; "
+            "border: 1px solid #ddd; }"
+            "QPushButton:hover { background-color: #ffb74d; }"
+            "QPushButton:pressed { background-color: #ff9800; color: white; }")
+        arrow_box = QVBoxLayout()
+        arrow_box.setContentsMargins(0, 0, 0, 0)
+        arrow_box.setSpacing(2)
+        self.heating_up_button = QPushButton("\u25B2")
+        self.heating_up_button.setFixedSize(36, self.TOUCH_BUTTON_SIZE // 2)
+        self.heating_up_button.setStyleSheet(arrow_style)
+        self.heating_up_button.clicked.connect(self.increment_heating_minutes)
+        arrow_box.addWidget(self.heating_up_button)
+        self.heating_down_button = QPushButton("\u25BC")
+        self.heating_down_button.setFixedSize(36, self.TOUCH_BUTTON_SIZE // 2)
+        self.heating_down_button.setStyleSheet(arrow_style)
+        self.heating_down_button.clicked.connect(self.decrement_heating_minutes)
+        arrow_box.addWidget(self.heating_down_button)
+        heating_layout.addLayout(arrow_box)
+
+        # Enlarged countdown display - big enough to read at a glance on the
+        # 7-inch touchscreen from arm's length. This is the only place the
+        # current duration is shown.
+        self.heating_display_label = QLabel(
+            f"{self.heating_timer_duration_seconds // 60:02d}:00")
+        self.heating_display_label.setFont(QFont("Arial", 20, QFont.Bold))
+        self.heating_display_label.setAlignment(Qt.AlignCenter)
+        self.heating_display_label.setStyleSheet(
+            "padding: 6px 10px; background-color: #fff3e0; border-radius: 5px; "
+            "border: 2px solid #ffb74d; color: #e65100;")
+        self.heating_display_label.setMinimumWidth(110)
+        heating_layout.addWidget(self.heating_display_label)
+
+        self.heating_toggle_button = self._make_touch_button(
+            "Start", "#ff9800", "#f57c00", self.toggle_heating_timer,
+            pressed="#ef6c00")
+        heating_layout.addWidget(self.heating_toggle_button)
+
+        heating_group.setLayout(heating_layout)
+        controls_layout.addWidget(heating_group, stretch=1)
         
         # Current detection info
         current_info_group = QGroupBox("Current Detection")
@@ -956,6 +1020,19 @@ class MainWindow(QMainWindow):
         self.log_text.setStyleSheet("font-family: Consolas, monospace; font-size: 11px; background-color: #f9f9f9; border: 1px solid #ddd; border-radius: 3px;")
         self._make_touch_scrollable(self.log_text)
         log_layout.addWidget(self.log_text)
+
+        # Buffer incoming log lines and flush them on a timer so a burst of
+        # print() calls from background threads (e.g. a failing camera polling
+        # at 10 Hz) does not flood the GUI event loop with one QTextEdit.append()
+        # per line. append() is O(n) in the document size, so thousands of
+        # separate appends make the UI unresponsive. The flush timer coalesces
+        # the whole burst into a single append + reflow, and _trim_log_text
+        # caps the document so append() stays cheap over time.
+        self._log_buffer = []
+        self._log_flush_timer = QTimer()
+        self._log_flush_timer.setInterval(100)
+        self._log_flush_timer.timeout.connect(self._flush_log_buffer)
+        self._log_flush_timer.start()
         
         log_group.setLayout(log_layout)
         info_layout.addWidget(log_group, stretch=1)
@@ -1961,26 +2038,107 @@ class MainWindow(QMainWindow):
                          f"{image_count} images stored)")
         return metadata
 
-    def set_red_light(self):
-        applied = self.led_controller.set_red()
-        suffix = "" if applied else " (simulated - no LED hardware)"
-        self.log_message(f"Red light activated{suffix}")
-        self.send_email_async("LED Control", self.email_notifier.send_activity_log,
-                              "LED Control", "Red light activated to lure rice weevils")
+    def toggle_heating_timer(self):
+        """Start or stop the heating timer depending on its current state."""
+        if self.heating_timer.isActive():
+            self.stop_heating_timer()
+        else:
+            self.start_heating_timer()
 
-    def set_white_light(self):
-        applied = self.led_controller.set_white()
-        suffix = "" if applied else " (simulated - no LED hardware)"
-        self.log_message(f"White light activated{suffix}")
-        self.send_email_async("LED Control", self.email_notifier.send_activity_log,
-                              "LED Control", "White light activated for detection")
+    def increment_heating_minutes(self):
+        """Increase the heating timer duration by 1 minute (max 60)."""
+        minutes = min(60, self.heating_timer_duration_seconds // 60 + 1)
+        self.heating_timer_duration_seconds = minutes * 60
+        self.heating_remaining_seconds = self.heating_timer_duration_seconds
+        self._update_heating_display()
 
-    def set_leds_off(self):
-        applied = self.led_controller.off()
-        suffix = "" if applied else " (simulated - no LED hardware)"
-        self.log_message(f"LEDs turned off{suffix}")
-        self.send_email_async("LED Control", self.email_notifier.send_activity_log,
-                              "LED Control", "LEDs turned off")
+    def decrement_heating_minutes(self):
+        """Decrease the heating timer duration by 1 minute (min 1)."""
+        minutes = max(1, self.heating_timer_duration_seconds // 60 - 1)
+        self.heating_timer_duration_seconds = minutes * 60
+        self.heating_remaining_seconds = self.heating_timer_duration_seconds
+        self._update_heating_display()
+
+    def start_heating_timer(self, auto: bool = False):
+        """Start the heating timer for the configured duration (default 3 min).
+
+        *auto* is True when triggered by the temperature exceeding the
+        threshold, so the System Log can distinguish an automatic start from a
+        manual one.
+        """
+        if self.heating_timer.isActive():
+            return
+        self.heating_remaining_seconds = self.heating_timer_duration_seconds
+        self.heating_timer.start(self.heating_timer_duration_seconds * 1000)
+        self.heating_countdown_timer.start(1000)
+        self.heating_toggle_button.setText("Stop")
+        self.heating_toggle_button.setStyleSheet(
+            self._touch_button_style("#f44336", "#d32f2f", "#b71c1c"))
+        # Lock the duration selector while running so a mid-cycle change cannot
+        # desync the countdown from the single-shot QTimer.
+        self.heating_up_button.setEnabled(False)
+        self.heating_down_button.setEnabled(False)
+        origin = "auto-started" if auto else "started"
+        self.log_message(
+            f"Heating timer {origin} "
+            f"({self.heating_timer_duration_seconds // 60:02d}:00)")
+        self._update_heating_display()
+
+    def stop_heating_timer(self):
+        """Stop the heating timer early, warning the user first.
+
+        Interrupting a heating cycle may leave the rig under-heated, so a
+        confirmation dialog is shown before the timer is actually stopped.
+        """
+        if not self.heating_timer.isActive():
+            return
+        reply = QMessageBox.warning(
+            self, "Stop Heating Timer",
+            "Stopping the heating timer early may affect the control process. "
+            "User may lose track of time.\n\n"
+            "Stop the timer anyway?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        self.heating_timer.stop()
+        self.heating_countdown_timer.stop()
+        self.heating_remaining_seconds = self.heating_timer_duration_seconds
+        self._reset_heating_button()
+        self.heating_up_button.setEnabled(True)
+        self.heating_down_button.setEnabled(True)
+        self.log_message("Heating timer stopped early by user")
+        self._update_heating_display()
+
+    def on_heating_timer_elapsed(self):
+        """Called when the heating cycle completes."""
+        self.heating_countdown_timer.stop()
+        self.heating_remaining_seconds = 0
+        self._reset_heating_button()
+        self.heating_up_button.setEnabled(True)
+        self.heating_down_button.setEnabled(True)
+        self.log_message("Heating timer completed")
+        self._update_heating_display()
+        # Re-arm so a fresh overheat event can trigger it again once the
+        # temperature returns to a safe level.
+        self._heating_auto_armed = False
+
+    def update_heating_countdown(self):
+        if not self.heating_timer.isActive():
+            return
+        remaining_ms = self.heating_timer.remainingTime()
+        remaining = max(0, remaining_ms // 1000) if remaining_ms >= 0 else 0
+        self.heating_remaining_seconds = remaining
+        self._update_heating_display()
+
+    def _reset_heating_button(self):
+        """Restore the Start button appearance after the timer stops."""
+        self.heating_toggle_button.setText("Start")
+        self.heating_toggle_button.setStyleSheet(
+            self._touch_button_style("#ff9800", "#f57c00", "#ef6c00"))
+
+    def _update_heating_display(self):
+        secs = self.heating_remaining_seconds
+        self.heating_display_label.setText(f"{secs // 60:02d}:{secs % 60:02d}")
 
     def adjust_zoom(self, side: str, direction: int):
         """Adjust the digital zoom factor for the left or right camera feed.
@@ -2290,6 +2448,19 @@ class MainWindow(QMainWindow):
         if error and error != getattr(self, '_last_temp_error', None):
             self.log_message(f"Temperature sensor: {error}")
         self._last_temp_error = error
+
+        # Auto-start the heating timer when the temperature exceeds the
+        # threshold. Fires once per overheat event: the _heating_auto_armed
+        # flag is only cleared when the temperature returns to a safe level
+        # (or when the timer completes), so the timer does not restart
+        # immediately on completion while still hot.
+        if temperature is not None:
+            if temperature > self.heating_temp_threshold_c:
+                if not self.heating_timer.isActive() and not self._heating_auto_armed:
+                    self._heating_auto_armed = True
+                    self.start_heating_timer(auto=True)
+            else:
+                self._heating_auto_armed = False
     
     def update_clock(self):
         now = datetime.now()
@@ -2301,16 +2472,53 @@ class MainWindow(QMainWindow):
         self.header_clock_label.setText(f"{date_str}   {time_str}")
 
     def log_message(self, message: str):
-        self.log_text.append(message)
-        # Auto-scroll to bottom
-        scrollbar = self.log_text.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        # Buffer the line; _flush_log_buffer appends it to the QTextEdit in a
+        # batched update so a burst of messages does not stall the GUI.
+        self._log_buffer.append(message)
 
     def _on_console_line(self, line: str):
         """Slot for ConsoleLogStream.line_printed — mirrors terminal output."""
-        self.log_text.append(line)
+        self._log_buffer.append(line)
+
+    def _flush_log_buffer(self):
+        """Drain buffered log lines into the System Log in one batch.
+
+        Coalescing many rapid prints (e.g. a failing camera) into a single
+        QTextEdit update keeps the GUI responsive. The document is also capped
+        so append() stays cheap instead of growing without bound and slowing
+        every subsequent append until the UI hangs.
+        """
+        if not self._log_buffer:
+            return
+        # One append() for the whole burst -> one document reflow instead of
+        # one per line.
+        self.log_text.append("\n".join(self._log_buffer))
+        self._log_buffer.clear()
+        self._trim_log_text()
         scrollbar = self.log_text.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
+
+    def _trim_log_text(self):
+        """Keep the System Log to at most MAX_LOG_LINES blocks.
+
+        QTextEdit.append() is O(n) in the document size, so an unbounded log
+        makes every append slower until the UI hangs. Dropping the oldest
+        blocks from the top keeps the document small and append() cheap.
+        """
+        doc = self.log_text.document()
+        max_lines = self.MAX_LOG_LINES
+        excess = doc.blockCount() - max_lines
+        if excess <= 0:
+            return
+        cursor = QTextCursor(doc)
+        cursor.beginEditBlock()
+        cursor.movePosition(QTextCursor.Start)
+        # Extend the selection to the end of the (excess)th block so the
+        # removed range spans whole blocks only.
+        for _ in range(excess):
+            cursor.movePosition(QTextCursor.NextBlock, QTextCursor.KeepAnchor)
+        cursor.removeSelectedText()
+        cursor.endEditBlock()
 
     def closeEvent(self, event):
         if self.is_scanning:
@@ -2323,6 +2531,10 @@ class MainWindow(QMainWindow):
             thread.wait(90000)
         self.led_controller.cleanup()
         self.temp_sensor.cleanup()
+        # Stop the log flush timer and drain any buffered lines so the last
+        # messages are written before stdout/stderr are restored below.
+        self._log_flush_timer.stop()
+        self._flush_log_buffer()
         # Restore original stdout/stderr so post-shutdown messages go to the real terminal
         sys.stdout = self._console_stream._original
         sys.stderr = self._console_stream_err._original

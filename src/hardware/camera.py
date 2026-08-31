@@ -194,6 +194,7 @@ class Camera:
         return True
 
     def _capture_loop(self):
+        logged_read_failure = False
         while self.running:
             try:
                 ret, frame = self.cap.read()
@@ -204,10 +205,17 @@ class Camera:
                         self.current_frame = None
                         self.signal_live = False
                         self.signal_reason = "no frame from device"
-                    print(f"Camera {self.camera_id}: failed to read frame")
+                    # Log the read failure once per outage, not on every poll.
+                    # A disconnected or virtual camera fails cap.read() at up to
+                    # 10 Hz, and each print() is mirrored into the System Log,
+                    # so logging every attempt floods the GUI and stalls it.
+                    if not logged_read_failure:
+                        print(f"Camera {self.camera_id}: failed to read frame")
+                        logged_read_failure = True
                     time.sleep(0.1)
                     continue
 
+                logged_read_failure = False
                 signature = self._signature(frame)
                 is_blank = float(signature.std()) < self.BLANK_STD_THRESHOLD
 

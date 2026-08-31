@@ -1,3 +1,8 @@
+# Shell scripts must stay LF or bash on the Raspberry Pi fails with
+# "/bin/bash^M: bad interpreter".
+*.sh text eol=lf
+# Windows batch files need CRLF.
+*.bat text eol=crlf
 anilag-raspberry-pi5.tar.gz filter=lfs diff=lfs merge=lfs -text
 user@amo filter=lfs diff=lfs merge=lfs -text
 user@anilag filter=lfs diff=lfs merge=lfs -text
