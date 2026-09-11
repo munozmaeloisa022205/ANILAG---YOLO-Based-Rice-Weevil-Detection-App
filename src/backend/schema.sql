@@ -9,8 +9,6 @@ CREATE TABLE IF NOT EXISTS scans (
     start_time TEXT NOT NULL,
     end_time TEXT NOT NULL,
     max_weevil_count INTEGER DEFAULT 0,
-    avg_temperature_celsius REAL,
-    temp_readings_count INTEGER DEFAULT 0,
     left_video_path TEXT,
     right_video_path TEXT,
     metadata_json TEXT,
@@ -22,9 +20,10 @@ CREATE TABLE IF NOT EXISTS detections (
     scan_id TEXT NOT NULL,
     timestamp TEXT NOT NULL,
     weevil_count INTEGER DEFAULT 0,
-    temperature_celsius REAL,
     recommendation TEXT,
     activity TEXT DEFAULT 'Detection',
+    left_count INTEGER DEFAULT 0,
+    right_count INTEGER DEFAULT 0,
     FOREIGN KEY (scan_id) REFERENCES scans(scan_id)
 );
 

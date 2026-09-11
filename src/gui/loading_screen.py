@@ -97,19 +97,26 @@ class LoadingScreen(QWidget):
 
     def init_ui(self):
         self.setWindowTitle("Anilag - Loading")
-        self.setFixedSize(600, 550)
         self.setStyleSheet("""
             QWidget {
                 background-color: #f5f5f5;
             }
         """)
-        
+
+        # Size to fit within the available screen geometry (excludes taskbar).
+        # The Pi 5 touchscreen at 1x scaling is 800x400.
+        from PyQt5.QtWidgets import QApplication
+        screen = QApplication.primaryScreen().availableGeometry()
+        w = min(500, int(screen.width() * 0.85))
+        h = min(380, int(screen.height() * 0.9))
+        self.setFixedSize(w, h)
+
         # Center on screen
         self._center_window()
-        
+
         layout = QVBoxLayout()
         layout.setSpacing(15)
-        layout.setContentsMargins(40, 40, 40, 40)
+        layout.setContentsMargins(40, 30, 40, 30)
         
         # Top stretch centers the content block vertically (paired with the
         # bottom stretch). Do NOT use layout.setAlignment(Qt.AlignCenter) here -
@@ -124,7 +131,7 @@ class LoadingScreen(QWidget):
         # with room for top/bottom stretches to vertically center the block.
         self.logo_container = QLabel()
         self.logo_container.setAlignment(Qt.AlignCenter)
-        self.logo_container.setFixedSize(220, 220)
+        self.logo_container.setFixedSize(140, 140)
         self.logo_container.setStyleSheet("""
             QLabel {
                 background: transparent;
@@ -132,15 +139,15 @@ class LoadingScreen(QWidget):
                 padding: 0px;
             }
         """)
-        
+
         if self.logo_path and os.path.exists(self.logo_path):
             pixmap = QPixmap(self.logo_path)
             # Crop transparent padding so only the logo artwork remains
             pixmap = self._crop_to_content(pixmap)
             # Scale cropped logo to fill the container while keeping aspect ratio
             scaled = pixmap.scaled(
-                220, 220, 
-                Qt.KeepAspectRatio, 
+                140, 140,
+                Qt.KeepAspectRatio,
                 Qt.SmoothTransformation
             )
             self.logo_container.setPixmap(scaled)
@@ -161,30 +168,28 @@ class LoadingScreen(QWidget):
         # Add spacing after logo
         layout.addSpacing(20)
         
-        # Tagline - compressed (smaller font + word wrap) so the long title
-        # "Rice Weevil Detection and Control System" fits within the 520px
-        # content width instead of overflowing the window.
+        # Tagline - word wrap so it fits the narrower window on the Pi 5.
         tagline_label = QLabel("Rice Weevil Detection and Control System")
         tagline_label.setFont(QFont("Arial", 13, QFont.Bold))
         tagline_label.setStyleSheet("color: #666666;")
         tagline_label.setAlignment(Qt.AlignCenter)
         tagline_label.setWordWrap(True)
-        tagline_label.setMaximumWidth(520)
+        tagline_label.setMaximumWidth(500)
         layout.addWidget(tagline_label)
-        
+
         # Add spacing after tagline
-        layout.addSpacing(8)
-        
+        layout.addSpacing(5)
+
         # Subtitle/version
         version_label = QLabel("v1.0.0")
         version_label.setFont(QFont("Arial", 11))
         version_label.setStyleSheet("color: #999999;")
         version_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(version_label)
-        
+
         # Add spacing after version
-        layout.addSpacing(20)
-        
+        layout.addSpacing(15)
+
         # Loading status text
         self.loading_label = QLabel("Initializing...")
         self.loading_label.setFont(QFont("Arial", 13))
@@ -220,7 +225,7 @@ class LoadingScreen(QWidget):
             }
         """)
         layout.addWidget(self.progress_bar)
-        
+
         # Detailed status
         self.status_label = QLabel("Loading components...")
         self.status_label.setFont(QFont("Arial", 10))
@@ -234,12 +239,18 @@ class LoadingScreen(QWidget):
         self.setLayout(layout)
     
     def _center_window(self):
-        """Center the window on the screen"""
-        screen = self.screen().geometry()
+        """Center the window in the available screen area (excludes the taskbar).
+
+        self.screen().geometry() returns the full physical screen including the
+        area covered by the Pi's desktop taskbar, so a window centered on it can
+        overlap the taskbar. availableGeometry() excludes the taskbar.
+        """
+        from PyQt5.QtWidgets import QApplication
+        screen = QApplication.primaryScreen().availableGeometry()
         size = self.geometry()
         self.move(
-            (screen.width() - size.width()) // 2,
-            (screen.height() - size.height()) // 2
+            screen.x() + (screen.width() - size.width()) // 2,
+            screen.y() + (screen.height() - size.height()) // 2
         )
     
     def setup_animations(self):
@@ -249,11 +260,11 @@ class LoadingScreen(QWidget):
         pass
     
     def setup_timer(self):
-        """Setup fast loading timer with smooth updates"""
-        self.loading_duration = 5.0  # seconds
+        """Setup loading timer with smooth updates"""
+        self.loading_duration = 5.0  # seconds — full splash screen duration
         self.elapsed_time = 0.0
         self.update_interval = 100  # ms
-        
+
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_progress)
         self.timer.start(self.update_interval)
@@ -266,9 +277,9 @@ class LoadingScreen(QWidget):
         
         # Status messages mapped to progress ranges
         status_map = [
-            (0, 15, "Initializing hardware...", "Detecting sensors..."),
+            (0, 15, "Initializing hardware...", "Opening cameras..."),
             (15, 30, "Loading detection models...", "Loading neural network weights..."),
-            (30, 50, "Configuring sensors...", "Calibrating camera module..."),
+            (30, 50, "Configuring cameras...", "Calibrating camera module..."),
             (50, 70, "Setting up database...", "Connecting to local storage..."),
             (70, 85, "Preparing interface...", "Loading UI components..."),
             (85, 98, "Finalizing setup...", "Performing system checks..."),
@@ -286,7 +297,7 @@ class LoadingScreen(QWidget):
             self.loading_label.setText("Ready!")
             self.status_label.setText("Launching application...")
             # Brief pause before emitting completion signal
-            QTimer.singleShot(800, self.loading_complete.emit)
+            QTimer.singleShot(500, self.loading_complete.emit)
     
     def closeEvent(self, event):
         """Clean up timer when closing"""

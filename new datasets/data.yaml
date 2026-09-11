@@ -1,0 +1,6 @@
+train: C:\Users\Eloisa\CascadeProjects\anilag\new datasets\train\images
+val: C:\Users\Eloisa\CascadeProjects\anilag\new datasets\valid\images
+test: C:\Users\Eloisa\CascadeProjects\anilag\new datasets\train\images
+
+nc: 1
+names: ['Sitophilus-Oryzae']

@@ -6,8 +6,6 @@ A PyQt5-based GUI application for detecting rice weevils using YOLOv11n on Raspb
 
 - **Live Camera Feed**: Real-time detection from USB webcams
 - **YOLOv11n Detection**: Optimized rice weevil detection model
-- **Temperature Monitoring**: DS18B20 sensor integration for heated rice temperature
-- **LED Control**: WS2813 LED control (red light for luring, white light for detection)
 - **Smart Logging**: Automatic logging with action recommendations
 - **Email Notifications**: Email alerts on every detection activity
 - **Recommendation System**:
@@ -18,9 +16,6 @@ A PyQt5-based GUI application for detecting rice weevils using YOLOv11n on Raspb
 
 - Raspberry Pi 5
 - USB webcams (left and right)
-- DS18B20 temperature sensor
-- WS2813 5V LED strip
-- Power supply for LED strip
 
 ## Software Requirements
 
@@ -28,7 +23,6 @@ A PyQt5-based GUI application for detecting rice weevils using YOLOv11n on Raspb
 - PyQt5
 - ultralytics (YOLOv11n)
 - OpenCV
-- rpi_ws281x
 
 ## Installation
 
@@ -45,19 +39,13 @@ pip install -r requirements.txt
 3. Configure settings:
 Edit `config.env` with your email credentials and hardware configurations.
 
-4. Enable 1-Wire interface for DS18B20:
-```bash
-sudo raspi-config
-# Navigate to Interface Options -> 1-Wire -> Enable
-```
-
-5. Enable camera:
+4. Enable camera:
 ```bash
 sudo raspi-config
 # Navigate to Interface Options -> Camera -> Enable
 ```
 
-6. Download YOLOv11n model:
+5. Download YOLOv11n model:
 ```bash
 mkdir -p models
 python -c "from ultralytics import YOLO; YOLO('yolov11n.pt').save('models/yolov11n.pt')"
@@ -74,20 +62,15 @@ python main.py
 
 - **Start Scan**: Begin live detection with camera feed
 - **Stop Scan**: Stop detection
-- **Red Light**: Turn on red LEDs to lure rice weevils
-- **White Light**: Turn on white LEDs for detection
-- **LEDs Off**: Turn off all LEDs
 
 ### Detection Workflow
 
 1. Click "Start Scan" to begin detection
 2. The system will:
    - Display live camera feed with detection boxes
-   - Monitor temperature from DS18B20 sensor
    - Log all detections with timestamps
    - Generate recommendations based on detection results
    - Send email notifications for each activity
-3. Use LED controls to optimize detection (red for luring, white for detection)
 
 ## Training Custom Model (Optional)
 
@@ -106,16 +89,6 @@ python train_model.py --data your_dataset.yaml --epochs 100
 - Ensure camera is enabled in raspi-config
 - Check camera cable connection
 - Test with `libcamera-hello`
-
-### Temperature sensor not working
-- Verify 1-Wire interface is enabled
-- Check sensor wiring (VCC, GND, DATA)
-- Verify device ID in config.env
-
-### LED not working
-- Check GPIO pin configuration
-- Verify power supply (5V for WS2813)
-- Check data line connection
 
 ### Email not sending
 - Verify SMTP settings
@@ -143,9 +116,7 @@ anilag/
 │   │   └── yolov11_detector.py
 │   ├── hardware/          # Hardware interfaces
 │   │   ├── __init__.py
-│   │   ├── camera.py
-│   │   ├── temperature.py
-│   │   └── led_controller.py
+│   │   └── camera.py
 │   ├── logging/           # Logging system
 │   │   ├── __init__.py
 │   │   └── logger.py

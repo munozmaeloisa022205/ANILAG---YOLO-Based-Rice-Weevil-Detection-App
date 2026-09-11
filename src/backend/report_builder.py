@@ -27,14 +27,15 @@ def build_detection_log_csv(detections: List[Dict], images_by_detection: Dict[Op
     """Render the detection log rows pulled from the database as CSV text."""
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(['Timestamp', 'Rice Weevil Count', 'Temperature (C)',
+    writer.writerow(['Timestamp', 'Rice Weevil Count',
+                     'Left Camera Count', 'Right Camera Count',
                      'Recommendation', 'Activity', 'Captured Images'])
     for row in detections:
-        temp = row.get('temperature_celsius')
         writer.writerow([
             row.get('timestamp', ''),
             row.get('weevil_count', 0),
-            round(temp, 2) if isinstance(temp, (int, float)) else '',
+            row.get('left_count', 0),
+            row.get('right_count', 0),
             row.get('recommendation', ''),
             row.get('activity', ''),
             '; '.join(images_by_detection.get(row.get('id'), [])),
@@ -66,8 +67,6 @@ def build_scan_summary(db: DatabaseManager, scan_id: str) -> Optional[Dict]:
         'scan_end_time': scan.get('end_time'),
         'duration_seconds': duration,
         'max_weevil_count': scan.get('max_weevil_count', 0),
-        'average_temperature_celsius': scan.get('avg_temperature_celsius'),
-        'temperature_readings_count': scan.get('temp_readings_count', 0),
         'log_entry_count': len(detections),
         'image_count': len(images),
         'image_total_bytes': sum(i.get('image_bytes') or 0 for i in images),

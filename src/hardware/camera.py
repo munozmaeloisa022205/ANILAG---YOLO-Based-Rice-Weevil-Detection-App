@@ -14,10 +14,11 @@ def _default_fourcc() -> str:
     """Pixel format to request from the driver.
 
     On the Raspberry Pi 5 both USB webcams share a single USB controller. Two
-    uncompressed YUYV streams at 640x480x30 need ~2 x 110 Mbit/s of isochronous
-    bandwidth, which the controller refuses to allocate - the second camera then
-    fails with 'VIDIOC_STREAMON: No space left on device' or silently drops to a
-    few FPS. MJPG is compressed in the camera, so both streams fit comfortably.
+    uncompressed YUYV streams at 1920x1080x30 need ~2 x 1.5 Gbit/s of
+    isochronous bandwidth, which the controller refuses to allocate - the
+    second camera then fails with 'VIDIOC_STREAMON: No space left on device'
+    or silently drops to a few FPS. MJPG is compressed in the camera, so both
+    1080p streams fit comfortably within the USB 3 bandwidth.
 
     Windows webcams are not on a shared bandwidth budget here and their drivers
     are pickier about formats, so they keep the driver default instead.
@@ -40,21 +41,31 @@ def list_capture_devices(probe_read: bool = True) -> List[int]:
     A UVC webcam on Raspberry Pi OS registers TWO nodes: an even one that streams
     video and an odd one that only carries UVC metadata. So a rig with two cameras
     exposes /dev/video0..3, where 0 and 2 are the cameras and 1 and 3 are metadata.
-    Configuring LEFT_CAMERA_ID=0 / RIGHT_CAMERA_ID=1 therefore points the "right"
-    camera at a metadata node that never produces an image.
 
     There is no sysfs attribute exposing V4L2 capabilities, so each node is opened
     and asked for one frame - the only definitive test.
+
+    PROBE LIMIT: Only the first 10 /dev/video* nodes are probed. The Pi 5 kernel
+    can create virtual nodes up to /dev/video30+ (codec, ISP, etc.) that each
+    have a 10-second select() timeout, so probing all of them takes 60-90+ seconds.
+    Real USB webcams always enumerate in the first few nodes (typically 0-7).
     """
     if not IS_LINUX:
         return []
 
+    # Cap the probe to the first N nodes. Virtual nodes (codec/ISP) with long
+    # timeouts live at higher indices and are never real USB webcams.
+    MAX_PROBE_NODES = 10
+
     indices = []
-    for path in sorted(glob.glob('/dev/video*')):
+    all_paths = sorted(glob.glob('/dev/video*'))
+    for path in all_paths:
         suffix = path[len('/dev/video'):]
         if not suffix.isdigit():
             continue
         index = int(suffix)
+        if index >= MAX_PROBE_NODES:
+            continue
         cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
         try:
             if not cap.isOpened():
@@ -62,6 +73,14 @@ def list_capture_devices(probe_read: bool = True) -> List[int]:
             if not probe_read:
                 indices.append(index)
                 continue
+            # Set a short timeout so a hung node doesn't block startup for 10s.
+            # The default V4L2 timeout is 10 seconds per node; with 30+ virtual
+            # nodes on the Pi 5, that adds up to 5+ minutes.
+            # These properties exist in OpenCV 4.x+; guard for older builds.
+            for prop_name in ('CAP_PROP_OPEN_TIMEOUT_MSEC', 'CAP_PROP_READ_TIMEOUT_MSEC'):
+                prop = getattr(cv2, prop_name, None)
+                if prop is not None:
+                    cap.set(prop, 2000)
             ok, frame = cap.read()
             if ok and frame is not None and frame.size > 0:
                 indices.append(index)
@@ -94,8 +113,13 @@ class Camera:
     OPEN_PROBE_ATTEMPTS = 10
     OPEN_PROBE_DELAY = 0.2
 
-    def __init__(self, camera_id: int = 0, width: int = 640, height: int = 480, fps: int = 30):
+    def __init__(self, camera_id: int = 0, width: int = 1920, height: int = 1080, fps: int = 30,
+                 display_name: str = None):
         self.camera_id = camera_id
+        # Logical name shown in logs (e.g. "Camera0"). Falls back to the raw
+        # V4L2 index if not set. On the Pi 5, auto-detect may remap /dev/video0
+        # to /dev/video2, so the raw index in logs would be confusing.
+        self.display_name = display_name or f"Camera {camera_id}"
         self.width = width
         self.height = height
         self.fps = fps
@@ -117,7 +141,7 @@ class Camera:
         # A negative id means "this camera is intentionally not installed", which
         # lets a single-camera rig run without the code pretending to open device 1.
         if self.camera_id < 0:
-            print(f"Camera {self.camera_id} disabled by configuration")
+            print(f"{self.display_name} disabled by configuration")
             return False
         try:
             # Ask for V4L2 explicitly on Linux. With CAP_ANY, OpenCV may pick its
@@ -131,7 +155,7 @@ class Camera:
             backend = cv2.CAP_V4L2 if IS_LINUX else cv2.CAP_DSHOW
             self.cap = cv2.VideoCapture(self.camera_id, backend)
             if not self.cap.isOpened():
-                print(f"Camera {self.camera_id}: device could not be opened")
+                print(f"{self.display_name}: device could not be opened")
                 self.cap = None
                 return False
 
@@ -149,14 +173,14 @@ class Camera:
             if not self._probe_first_frame():
                 # On Linux this is the usual symptom of pointing at a UVC metadata
                 # node rather than a capture node.
-                print(f"Camera {self.camera_id}: opened but delivered no frame")
+                print(f"{self.display_name}: opened but delivered no frame")
                 self.cap.release()
                 self.cap = None
                 return False
 
             actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            print(f"Camera {self.camera_id}: {actual_w}x{actual_h} "
+            print(f"{self.display_name}: {actual_w}x{actual_h} "
                   f"{self.fourcc or 'default'} @ {self.cap.get(cv2.CAP_PROP_FPS):g} FPS")
             return True
         except Exception as e:
@@ -210,7 +234,7 @@ class Camera:
                     # 10 Hz, and each print() is mirrored into the System Log,
                     # so logging every attempt floods the GUI and stalls it.
                     if not logged_read_failure:
-                        print(f"Camera {self.camera_id}: failed to read frame")
+                        print(f"{self.display_name}: failed to read frame")
                         logged_read_failure = True
                     time.sleep(0.1)
                     continue
@@ -246,9 +270,9 @@ class Camera:
 
                 # Log transitions only, so a dead camera does not spam the log
                 if became_dead:
-                    print(f"Camera {self.camera_id}: signal lost - {reason}")
+                    print(f"{self.display_name}: signal lost - {reason}")
                 elif became_live:
-                    print(f"Camera {self.camera_id}: live signal detected")
+                    print(f"{self.display_name}: live signal detected")
 
                 if self.frame_callback:
                     self.frame_callback(frame)
@@ -269,7 +293,7 @@ class Camera:
         """Return the current frame without copying.
 
         Faster than get_frame() — the .copy() in get_frame() is a full-frame
-        memcpy (640x480x3 = ~900 KB) that adds up at 30 FPS. Safe as long as
+        memcpy (1920x1080x3 = ~6 MB) that adds up at 30 FPS. Safe as long as
         the caller only reads the array (never mutates it). The capture loop
         replaces current_frame atomically under self.lock, so the returned
         array's backing memory stays valid until the next cap.read() overwrites
@@ -340,7 +364,7 @@ class DualCameraManager:
     DUPLICATE_SAMPLE_DELAY = 0.15
 
     def __init__(self, left_camera_id: int = 0, right_camera_id: int = 1,
-                 width: int = 640, height: int = 480, fps: int = 30):
+                 width: int = 1920, height: int = 1080, fps: int = 30):
         # Guard against both IDs pointing at the same physical device. On Windows,
         # OpenCV may expose the same camera under multiple indices (e.g. MSMF and
         # DShow backends), which would make both feeds show identical pictures.
@@ -353,8 +377,10 @@ class DualCameraManager:
             right_camera_id = -1
 
         left_camera_id, right_camera_id = self._resolve_ids(left_camera_id, right_camera_id)
-        self.left_camera = Camera(left_camera_id, width, height, fps)
-        self.right_camera = Camera(right_camera_id, width, height, fps)
+        # Pass logical display names so logs show "Camera0"/"Camera1" regardless
+        # of which /dev/videoN index the Pi's auto-detect remaps them to.
+        self.left_camera = Camera(left_camera_id, width, height, fps, display_name="Camera0")
+        self.right_camera = Camera(right_camera_id, width, height, fps, display_name="Camera1")
         self.running = False
 
     @staticmethod
@@ -365,6 +391,12 @@ class DualCameraManager:
         so the obvious 0/1 pairing usually lands the right camera on camera 0's
         metadata node. Probing once here means config.env does not have to encode
         the kernel's enumeration order, which changes with USB port and boot.
+
+        When RIGHT_CAMERA_ID=-1 (disabled) but a second USB camera is plugged in,
+        auto-detect assigns it to the right camera so the feed appears without
+        needing a config change. This makes the rig plug-and-play for dual-camera
+        use: set -1 when only one camera is connected, plug in the second and
+        restart the app.
 
         Set CAMERA_AUTO_DETECT=false to use the configured indices verbatim.
         """
@@ -383,7 +415,17 @@ class DualCameraManager:
         resolved = []
         for name, configured in (('left', left_id), ('right', right_id)):
             if configured < 0:
-                resolved.append(-1)
+                # A disabled camera (-1) is only re-enabled if there is a spare
+                # capture device that has not already been claimed by the other
+                # camera. This lets a single-camera rig (RIGHT=-1) automatically
+                # pick up a second USB webcam when one is plugged in.
+                fallback = next((i for i in available if i not in resolved), -1)
+                if fallback >= 0:
+                    print(f"Auto-enabling {name} camera -> /dev/video{fallback} "
+                          f"(was disabled by config, but a capture device is available)")
+                    resolved.append(fallback)
+                else:
+                    resolved.append(-1)
                 continue
             if configured in available and configured not in resolved:
                 resolved.append(configured)
@@ -438,8 +480,8 @@ class DualCameraManager:
         check_enabled = os.getenv('CAMERA_DUPLICATE_CHECK', 'true').lower() in (
             'true', '1', 'yes', 'on')
         if left_started and right_started and check_enabled and self._sources_are_duplicates():
-            print(f"WARNING: cameras {self.left_camera.camera_id} and "
-                  f"{self.right_camera.camera_id} are delivering an identical picture, so "
+            print(f"WARNING: {self.left_camera.display_name} and "
+                  f"{self.right_camera.display_name} are delivering an identical picture, so "
                   f"they are the same physical camera. Disabling the right feed to avoid "
                   f"double-counting. One of the two indices is most likely a virtual camera "
                   f"(NVIDIA Broadcast, OBS); set RIGHT_CAMERA_ID in config.env to the other "

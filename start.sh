@@ -11,7 +11,6 @@ if [ "${ARCH}" = "aarch64" ] || [ "${ARCH}" = "armv7l" ]; then
     if ! python3 -c "import PyQt5" 2>/dev/null; then
         echo "ERROR: PyQt5 is not installed system-wide (required on ${ARCH})."
         echo "Install it with: sudo apt install -y python3-pyqt5 python3-dev"
-        echo "(python3-dev is also needed to build the spidev package)"
         exit 1
     fi
 fi
@@ -34,11 +33,17 @@ pip install -r requirements.txt || { echo "ERROR: dependency install failed."; e
 # pip does not treat opencv-python-headless as satisfying it - so on the Pi it
 # gets installed anyway. That wheel bundles its own Qt libraries, which clash
 # with the apt PyQt5 ("Cannot mix incompatible Qt library" / xcb plugin abort).
-# Remove it; opencv-python-headless from requirements.txt provides cv2.
+# Remove it and force-reinstall the headless wheel: both packages write to the
+# same cv2/ directory, so uninstalling opencv-python also deletes the files
+# opencv-python-headless installed. A plain reinstall is not enough because pip
+# sees the headless package as already satisfied; --force-reinstall restores the
+# shared cv2 files.
 if [ "${ARCH}" = "aarch64" ] || [ "${ARCH}" = "armv7l" ]; then
     if pip show opencv-python >/dev/null 2>&1; then
         echo "Removing non-headless opencv-python (conflicts with apt PyQt5)..."
         pip uninstall -y opencv-python
+        echo "Reinstalling opencv-python-headless (restores shared cv2 files)..."
+        pip install --force-reinstall --no-deps opencv-python-headless>=4.11.0.86
     fi
 fi
 

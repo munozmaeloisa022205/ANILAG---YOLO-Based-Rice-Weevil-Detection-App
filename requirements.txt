@@ -35,10 +35,3 @@ pillow>=11.0.0
 pyserial==3.5
 python-dotenv==1.0.1
 ncnn>=1.0.20250501
-# WS2813 LEDs.
-# On the Raspberry Pi 5 the strip is driven over hardware SPI via spidev, because
-# rpi_ws281x cannot work on the Pi 5 (its GPIOs run through the RP1 chip, which is
-# incompatible with the BCM PWM/DMA peripheral rpi_ws281x uses).
-spidev>=3.6; platform_machine == "aarch64" or platform_machine == "armv7l"
-# Still used automatically on Pi 4 and older, where it does work.
-rpi_ws281x>=4.3.0; platform_machine == "armv7l"

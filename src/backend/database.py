@@ -53,6 +53,16 @@ class DatabaseManager:
             schema_sql = f.read()
         with self._get_connection() as conn:
             conn.executescript(schema_sql)
+            # Idempotent column additions for databases created before the
+            # per-camera count columns existed. CREATE TABLE IF NOT EXISTS does
+            # not add columns to an existing table, so ALTER TABLE is needed.
+            # "duplicate column name" is raised if the column already exists.
+            for col in ('left_count', 'right_count'):
+                try:
+                    conn.execute(
+                        f"ALTER TABLE detections ADD COLUMN {col} INTEGER DEFAULT 0")
+                except sqlite3.OperationalError:
+                    pass
     
     def create_scan(self, scan_id: str, start_time: str, left_video_path: str, 
                     right_video_path: str) -> int:
@@ -67,43 +77,48 @@ class DatabaseManager:
             )
             return cursor.lastrowid
     
-    def update_scan(self, scan_id: str, end_time: str, max_count: int, 
-                    avg_temp: float, temp_readings_count: int, metadata_json: str = None):
+    def update_scan(self, scan_id: str, end_time: str, max_count: int,
+                    metadata_json: str = None):
         """Update scan record with final data"""
         with self._get_connection() as conn:
             if metadata_json:
                 conn.execute(
                     """
-                    UPDATE scans 
-                    SET end_time=?, max_weevil_count=?, avg_temperature_celsius=?, 
-                        temp_readings_count=?, metadata_json=?
+                    UPDATE scans
+                    SET end_time=?, max_weevil_count=?, metadata_json=?
                     WHERE scan_id=?
                     """,
-                    (end_time, max_count, avg_temp, temp_readings_count, metadata_json, scan_id)
+                    (end_time, max_count, metadata_json, scan_id)
                 )
             else:
                 conn.execute(
                     """
-                    UPDATE scans 
-                    SET end_time=?, max_weevil_count=?, avg_temperature_celsius=?, 
-                        temp_readings_count=?
+                    UPDATE scans
+                    SET end_time=?, max_weevil_count=?
                     WHERE scan_id=?
                     """,
-                    (end_time, max_count, avg_temp, temp_readings_count, scan_id)
+                    (end_time, max_count, scan_id)
                 )
     
-    def add_detection(self, scan_id: str, timestamp: str, weevil_count: int, 
-                      temperature: Optional[float], recommendation: str, 
-                      activity: str = "Detection") -> int:
-        """Add a detection record"""
+    def add_detection(self, scan_id: str, timestamp: str, weevil_count: int,
+                      recommendation: str,
+                      activity: str = "Detection",
+                      left_count: int = 0, right_count: int = 0) -> int:
+        """Add a detection record.
+
+        weevil_count is the deduplicated total reported to the user (max of the
+        two per-camera counts for a dual-camera scan). left_count/right_count
+        preserve each camera's individual reading for the audit trail.
+        """
         with self._get_connection() as conn:
             cursor = conn.execute(
                 """
-                INSERT INTO detections (scan_id, timestamp, weevil_count, temperature_celsius, 
-                                       recommendation, activity)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO detections (scan_id, timestamp, weevil_count,
+                                       recommendation, activity, left_count, right_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (scan_id, timestamp, weevil_count, temperature, recommendation, activity)
+                (scan_id, timestamp, weevil_count, recommendation, activity,
+                 left_count, right_count)
             )
             return cursor.lastrowid
     
@@ -259,12 +274,11 @@ class DatabaseManager:
             if scan_id:
                 cursor = conn.execute(
                     """
-                    SELECT 
+                    SELECT
                         COUNT(*) as total_detections,
                         AVG(weevil_count) as avg_count,
-                        MAX(weevil_count) as max_count,
-                        AVG(temperature_celsius) as avg_temp
-                    FROM detections 
+                        MAX(weevil_count) as max_count
+                    FROM detections
                     WHERE scan_id=?
                     """,
                     (scan_id,)
@@ -272,11 +286,10 @@ class DatabaseManager:
             else:
                 cursor = conn.execute(
                     """
-                    SELECT 
+                    SELECT
                         COUNT(*) as total_detections,
                         AVG(weevil_count) as avg_count,
-                        MAX(weevil_count) as max_count,
-                        AVG(temperature_celsius) as avg_temp
+                        MAX(weevil_count) as max_count
                     FROM detections
                     """
                 )

@@ -175,20 +175,10 @@ headless build loses nothing.
 Or just run `./start.sh`, which performs all of the above and checks the
 `video` group membership needed to open the cameras.
 
-### 4. Install Hardware-Specific Dependencies
-```bash
-# LED control. On the Pi 5 the WS2813 strip is driven over hardware SPI via
-# spidev - rpi_ws281x cannot work here (see the LED section below), and pip
-# installs spidev automatically from requirements.txt.
-
-# For 1-Wire temperature sensor support
-sudo apt install -y python3-w1thermsensor
-```
-
-### 5. Enable Required Interfaces
+### 4. Enable Required Interfaces
 ```bash
 sudo raspi-config
-# Enable: I2C, SPI, Serial, 1-Wire
+# Enable: I2C, SPI, Serial
 
 # Camera access requires membership of the 'video' group
 sudo usermod -aG video $USER   # log out and back in afterwards
@@ -204,37 +194,44 @@ python main.py
 ### Auto-Start on Boot (Raspberry Pi 5)
 
 The application can launch automatically when the Pi boots so the operator does
-not need to log in or type any commands. Two methods are provided — use **either**
-the systemd service (recommended, runs as a managed service) **or** the desktop
-autostart entry (runs inside the LXDE desktop session).
+not need to log in or type any commands. A setup script is provided that installs
+a systemd service which waits for the desktop display to be ready, then launches
+Anilag.
 
-#### Method 1: systemd service (recommended)
+#### Method 1: setup script (recommended)
 
 ```bash
-# 1. Copy the service file into systemd
-sudo cp scripts/anilag.service /etc/systemd/system/
+cd ~/anilag
+chmod +x deploy/setup_autostart.sh
+./deploy/setup_autostart.sh
+```
 
-# 2. Make the launch script executable
-chmod +x scripts/anilag-autostart.sh
+The script:
+- Copies `deploy/anilag.service` into `/etc/systemd/system/`
+- Automatically detects the app directory and current user
+- Enables the service so it starts on every boot
+- Waits for the X display (`/tmp/.X11-unix/X0`) before launching the GUI
 
-# 3. If Anilag is NOT installed at /home/pi/anilag, edit both files and
-#    change every /home/pi/anilag path to your actual install directory:
-#    - scripts/anilag-autostart.sh  (PROJECT_DIR and VENV_PYTHON)
-#    - /etc/systemd/system/anilag.service (WorkingDirectory, ExecStart, Environment)
-
-# 4. Reload systemd and enable the service
-sudo systemctl daemon-reload
-sudo systemctl enable anilag.service
-
-# 5. Reboot to test
+After running the script, reboot to test:
+```bash
 sudo reboot
 ```
 
-After reboot the loading screen should appear automatically within a few seconds.
-Check the service status and logs with:
+The loading screen should appear automatically within a few seconds after the
+desktop loads. Check the service status and logs with:
 ```bash
 sudo systemctl status anilag.service
 sudo journalctl -u anilag.service -f
+```
+
+To start the service immediately without rebooting:
+```bash
+sudo systemctl start anilag.service
+```
+
+To stop:
+```bash
+sudo systemctl stop anilag.service
 ```
 
 To disable auto-start:
@@ -242,20 +239,26 @@ To disable auto-start:
 sudo systemctl disable anilag.service
 ```
 
-#### Method 2: desktop autostart entry
+#### Method 2: desktop autostart entry (alternative)
+
+If you prefer a desktop-level autostart instead of systemd:
 
 ```bash
-# 1. Make the launch script executable
-chmod +x scripts/anilag-autostart.sh
-
-# 2. Copy the .desktop file into the LXDE autostart directory
 mkdir -p ~/.config/autostart
-cp scripts/anilag.desktop ~/.config/autostart/
+cat > ~/.config/autostart/anilag.desktop << 'EOF'
+[Desktop Entry]
+Type=Application
+Name=Anilag
+Comment=Rice Weevil Detection System
+Exec=/bin/bash -c "source /home/user/anilag/venv/bin/activate && cd /home/user/anilag && python main.py"
+Icon=/home/user/anilag/assets/logo.png
+Terminal=false
+Categories=Science;
+EOF
+```
 
-# 3. If Anilag is NOT installed at /home/pi/anilag, edit the .desktop file and
-#    change the Exec= and Icon= paths to your actual install directory.
-
-# 4. Reboot to test
+Reboot to test:
+```bash
 sudo reboot
 ```
 

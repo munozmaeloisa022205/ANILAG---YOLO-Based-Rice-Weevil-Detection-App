@@ -1,0 +1,34 @@
+[Unit]
+Description=Anilag Rice Weevil Detection System
+After=graphical.target
+Wants=graphical.target
+
+[Service]
+Type=simple
+User=user
+WorkingDirectory=/home/user/anilag
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/user/.Xauthority
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+# Wait for the X display, then hide the taskbar (lxpanel) so Anilag gets the
+# full screen. lxpanel is the default panel on Raspberry Pi OS / LXDE.
+# If lxpanel is not running (e.g. Wayland or a different DE), the commands
+# silently fail and the app still launches.
+ExecStartPre=/bin/bash -c 'until [ -e /tmp/.X11-unix/X0 ]; do sleep 1; done'
+# Grant local access to the X display so the systemd service can connect.
+# On Raspberry Pi OS with Wayland/XWayland the session cookie is not always
+# passed to systemd, so xhost +local: opens the display to local connections.
+ExecStartPre=/bin/bash -c 'xhost +local: 2>/dev/null || true'
+ExecStartPre=/bin/bash -c 'pgrep lxpanel && xdotool key super || true'
+ExecStartPre=/bin/bash -c 'pkill lxpanel || true'
+ExecStartPre=/bin/bash -c 'pkill waybar || true'
+ExecStart=/bin/bash -c 'source venv/bin/activate && python main.py'
+# Restore the taskbar when Anilag exits so the desktop is usable again.
+ExecStopPost=/bin/bash -c 'nohup lxpanel > /dev/null 2>&1 &'
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical.target
