@@ -60,6 +60,13 @@ models/*_ncnn_model/
 # They are excluded via .git/info/exclude instead of here, which keeps git ignoring
 # them while still allowing tooling to edit them. Do not add them back to this file.
 
+# Local SQLite database (contains scan images, emailed report archives, and
+# recipient email addresses - sensitive). Keep local, never commit.
+data/*.db
+data/*.db-journal
+data/*.sqlite
+data/*.sqlite3
+
 
 # OS
 .DS_Store
